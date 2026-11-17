@@ -7,6 +7,8 @@ A small, fast, native replacement for Synology Assistant: find your Synology NAS
 wake it with Wake-on-LAN, and start a memory test. Runs on Apple Silicon without Rosetta, and on Windows and Linux.
 </p>
 
+<p align="center"><img src="assets/screenshot.png" width="820" alt="Device list with help panel"></p>
+
 > [!WARNING]
 > **Unofficial and vibe coded.** This project is not affiliated with, endorsed by, or supported by Synology Inc.
 > It was built with an AI coding assistant by reverse-engineering the network protocol of the original app.
@@ -53,6 +55,7 @@ Requires [Rust](https://rustup.rs) (stable).
 ```sh
 cargo run --release           # run the app
 cargo test                    # unit tests (protocol, crypto, WOL)
+cargo test --release --bin synology-assistant ui_snapshots -- --ignored  # render UI screenshots to target/ui-shots
 ./bundle.sh                   # macOS: build dist/Synology Assistant.app
 ```
 

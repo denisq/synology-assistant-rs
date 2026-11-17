@@ -49,7 +49,9 @@ pub fn broadcast_targets() -> Vec<Ipv4Addr> {
                 continue;
             }
             if let if_addrs::IfAddr::V4(a) = i.addr {
-                let b = a.broadcast.unwrap_or_else(|| Ipv4Addr::from(u32::from(a.ip) | !u32::from(a.netmask)));
+                let b = a
+                    .broadcast
+                    .unwrap_or_else(|| Ipv4Addr::from(u32::from(a.ip) | !u32::from(a.netmask)));
                 if !v.contains(&b) && !a.ip.is_link_local() {
                     v.push(b);
                 }
@@ -99,18 +101,29 @@ impl Discovery {
                 let mut devs = rx_devs.lock().unwrap();
                 let mut info = info;
                 // Plain replies don't carry the key; keep the one we already learned.
-                if let Some(old) = devs.get(&info.mac) {
-                    if info.public_key.is_empty() {
-                        info.public_key = old.info.public_key.clone();
-                        info.session_id = info.session_id.or(old.info.session_id);
-                    }
+                if let Some(old) = devs.get(&info.mac)
+                    && info.public_key.is_empty()
+                {
+                    info.public_key = old.info.public_key.clone();
+                    info.session_id = info.session_id.or(old.info.session_id);
                 }
-                devs.insert(info.mac.clone(), Device { info, last_seen: Instant::now() });
+                devs.insert(
+                    info.mac.clone(),
+                    Device {
+                        info,
+                        last_seen: Instant::now(),
+                    },
+                );
                 drop(devs);
                 on_update();
             }
         })?;
-        Ok(Self { socket, session, devices, acks })
+        Ok(Self {
+            socket,
+            session,
+            devices,
+            acks,
+        })
     }
 
     fn broadcast(&self, pkt: &[u8]) {
@@ -131,8 +144,7 @@ impl Discovery {
         let encrypted = !dev.public_key.is_empty() && dev.session_id.is_some();
         let plain = protocol::build_memtest(&dev.mac, account, password, encrypted.then_some(self.session.id));
         let pkt = if encrypted {
-            secure::seal(&plain, &dev.public_key)
-                .ok_or_else(|| io::Error::other("invalid NAS public key"))?
+            secure::seal(&plain, &dev.public_key).ok_or_else(|| io::Error::other("invalid NAS public key"))?
         } else {
             plain
         };

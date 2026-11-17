@@ -1,10 +1,12 @@
 // Release builds on Windows are GUI apps (no console window); CLI flags re-attach to the parent console.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
-use synology_assistant_rs::{discovery, help, protocol, wol};
+mod theme;
+
 use discovery::{Device, Discovery};
 use eframe::egui;
 use std::time::{Duration, Instant};
+use synology_assistant_rs::{discovery, help, protocol, wol};
 use wol::WolDevice;
 
 const AUTO_SEARCH: Duration = Duration::from_secs(10);
@@ -29,7 +31,9 @@ fn main() {
         Some("--scan") => std::process::exit(cli_scan()),
         Some("--wake") => std::process::exit(cli_wake(args.get(1))),
         Some("--help" | "-h") => {
-            println!("Synology Assistant (native)\n\n  (no args)      open the app\n  --scan         list Synology devices on the LAN\n  --wake <MAC>   send a Wake-on-LAN packet");
+            println!(
+                "Synology Assistant (native)\n\n  (no args)      open the app\n  --scan         list Synology devices on the LAN\n  --wake <MAC>   send a Wake-on-LAN packet"
+            );
         }
         _ => run_gui(),
     }
@@ -42,7 +46,10 @@ fn cli_scan() -> i32 {
             1
         }
         Ok(list) => {
-            println!("{:<18} {:<16} {:<32} {:<18} {:<10} {:<14} {}", "NAME", "IP", "STATUS", "MAC", "MODEL", "DSM", "SERIAL");
+            println!(
+                "{:<18} {:<16} {:<32} {:<18} {:<10} {:<14} SERIAL",
+                "NAME", "IP", "STATUS", "MAC", "MODEL", "DSM"
+            );
             for n in list {
                 println!(
                     "{:<18} {:<16} {:<32} {:<18} {:<10} {:<14} {}",
@@ -58,7 +65,10 @@ fn cli_scan() -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("Cannot listen on UDP port {}: {e}\n(Is the old Synology Assistant still running?)", protocol::PORT);
+            eprintln!(
+                "Cannot listen on UDP port {}: {e}\n(Is the old Synology Assistant still running?)",
+                protocol::PORT
+            );
             2
         }
     }
@@ -69,7 +79,13 @@ fn cli_wake(mac: Option<&String>) -> i32 {
         eprintln!("usage: --wake <MAC>");
         return 2;
     };
-    let dev = WolDevice { name: String::new(), mac: mac.clone(), ip: String::new(), target: String::new(), port: 9 };
+    let dev = WolDevice {
+        name: String::new(),
+        mac: mac.clone(),
+        ip: String::new(),
+        target: String::new(),
+        port: 9,
+    };
     match wol::wake(&dev) {
         Ok(n) => {
             println!("Sent {n} magic packets to {mac}");
@@ -114,6 +130,8 @@ struct App {
     /// "Add device" dialog for Wake on LAN.
     new_wol: Option<WolDevice>,
     show_help: bool,
+    /// Devices injected by UI tests instead of live discovery.
+    fake_devices: Option<Vec<Device>>,
     status: String,
     memtest: Option<MemTestDialog>,
     /// Devices seen running a memory test in this session (to report the result).
@@ -156,26 +174,43 @@ const SYSTEM_FONTS: &[&str] = &[
 /// Use the platform's UI font instead of egui's bundled one.
 fn setup_fonts(ctx: &egui::Context) {
     let candidates = SYSTEM_FONTS;
-    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else { return };
+    let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
+        return;
+    };
     let mut fonts = egui::FontDefinitions::default();
-    let tweak = egui::FontTweak { hinting: Some(false), ..Default::default() };
+    let tweak = egui::FontTweak {
+        hinting: Some(false),
+        ..Default::default()
+    };
+    fonts.font_data.insert(
+        "system".into(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(tweak)),
+    );
     fonts
-        .font_data
-        .insert("system".into(), std::sync::Arc::new(egui::FontData::from_owned(bytes).tweak(tweak)));
-    fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "system".into());
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "system".into());
     ctx.set_fonts(fonts);
     ctx.global_style_mut(|style| {
         use egui::{FontFamily::Proportional, FontId, TextStyle};
-        style.text_styles.insert(TextStyle::Body, FontId::new(13.5, Proportional));
-        style.text_styles.insert(TextStyle::Button, FontId::new(13.5, Proportional));
-        style.text_styles.insert(TextStyle::Small, FontId::new(11.0, Proportional));
-        style.text_styles.insert(TextStyle::Heading, FontId::new(18.0, Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Body, FontId::new(13.5, Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Button, FontId::new(13.5, Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Small, FontId::new(11.0, Proportional));
+        style
+            .text_styles
+            .insert(TextStyle::Heading, FontId::new(18.0, Proportional));
     });
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        setup_fonts(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let disco = Discovery::start(move || ctx.request_repaint()).map_err(|e| {
             format!(
@@ -183,6 +218,12 @@ impl App {
                 protocol::PORT
             )
         });
+        Self::build(cc, disco)
+    }
+
+    fn build(cc: &eframe::CreationContext<'_>, disco: Result<Discovery, String>) -> Self {
+        setup_fonts(&cc.egui_ctx);
+        theme::apply(&cc.egui_ctx);
         let status = match &disco {
             Ok(_) => "Searching…".to_string(),
             Err(e) => e.clone(),
@@ -196,6 +237,7 @@ impl App {
             wol_selected: None,
             new_wol: None,
             show_help: false,
+            fake_devices: None,
             status,
             memtest: None,
             testing: Default::default(),
@@ -211,7 +253,10 @@ impl App {
                 self.testing.insert(n.mac.clone());
             } else if self.testing.remove(&n.mac) {
                 self.status = if n.progress.unwrap_or(0) != 0 {
-                    format!("{}: one or more errors have been found by the memory diagnostic test.", n.name)
+                    format!(
+                        "{}: one or more errors have been found by the memory diagnostic test.",
+                        n.name
+                    )
                 } else {
                     format!("{}: memory test finished, no errors were found.", n.name)
                 };
@@ -246,10 +291,10 @@ impl App {
         let mut close = false;
         let mut start = false;
         let mut retry = false;
-        let modal = egui::Modal::new(egui::Id::unique("memtest")).show(ctx, |ui| {
-            ui.set_width(420.0);
+        let modal = egui::Modal::new(egui::Id::unique("memtest")).frame(dialog_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(440.0);
             ui.heading("Memory Diagnostic Tool");
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             match &dlg.phase {
                 MemTestPhase::Form => {
                     ui.label(format!(
@@ -262,11 +307,11 @@ impl App {
                     ui.label("Only an administrator can run the memory test. Enter a DSM administrator account:");
                     ui.add_space(4.0);
                     egui::Grid::new("memtest_form").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                        ui.label("Account");
-                        ui.text_edit_singleline(&mut dlg.account);
+                        let l = ui.label("Account");
+                        ui.text_edit_singleline(&mut dlg.account).labelled_by(l.id);
                         ui.end_row();
-                        ui.label("Password");
-                        let r = ui.add(egui::TextEdit::singleline(&mut dlg.password).password(true));
+                        let l = ui.label("Password");
+                        let r = ui.add(egui::TextEdit::singleline(&mut dlg.password).password(true)).labelled_by(l.id);
                         if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             start = true;
                         }
@@ -280,16 +325,9 @@ impl App {
                         );
                         ui.checkbox(&mut dlg.accept_unencrypted, "Send it anyway");
                     }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let ok = !dlg.account.trim().is_empty() && (!dlg.unencrypted || dlg.accept_unencrypted);
-                        if ui.add_enabled(ok, egui::Button::new("Start memory test")).clicked() {
-                            start = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close = true;
-                        }
-                    });
+                    ui.add_space(12.0);
+                    let ok = !dlg.account.trim().is_empty() && (!dlg.unencrypted || dlg.accept_unencrypted);
+                    dialog_buttons(ui, "Start memory test", ok, &mut start, &mut close);
                     if dlg.account.trim().is_empty() || (dlg.unencrypted && !dlg.accept_unencrypted) {
                         start = false;
                     }
@@ -305,13 +343,13 @@ impl App {
                         Ok(m) => ui.label(m),
                         Err(m) => ui.colored_label(ui.visuals().error_fg_color, m),
                     };
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, "Close", true).clicked() {
+                            close = true;
+                        }
                         if r.is_err() && ui.button("Try again").clicked() {
                             retry = true;
-                        }
-                        if ui.button("Close").clicked() {
-                            close = true;
                         }
                     });
                 }
@@ -343,6 +381,18 @@ impl App {
         }
     }
 
+    fn open_memtest(&mut self, d: &Device) {
+        self.memtest = Some(MemTestDialog {
+            mac: d.info.mac.clone(),
+            name: d.info.name.clone(),
+            account: String::new(),
+            password: String::new(),
+            unencrypted: d.info.public_key.is_empty() || d.info.session_id.is_none(),
+            accept_unencrypted: false,
+            phase: MemTestPhase::Form,
+        });
+    }
+
     fn search(&mut self) {
         if let Ok(d) = &self.disco {
             d.search();
@@ -351,8 +401,11 @@ impl App {
     }
 
     fn devices(&self) -> Vec<Device> {
-        let mut v = self.disco.as_ref().map(|d| d.snapshot()).unwrap_or_default();
-        v.sort_by(|a, b| a.info.name.to_lowercase().cmp(&b.info.name.to_lowercase()));
+        let mut v = match &self.fake_devices {
+            Some(f) => f.clone(),
+            None => self.disco.as_ref().map(|d| d.snapshot()).unwrap_or_default(),
+        };
+        v.sort_by_key(|a| a.info.name.to_lowercase());
         v
     }
 
@@ -362,11 +415,19 @@ impl App {
     }
 
     fn is_online(&self, mac: &str) -> bool {
-        let Some(m) = wol::parse_mac(mac).map(|m| wol::format_mac(&m)) else { return false };
+        let Some(m) = wol::parse_mac(mac).map(|m| wol::format_mac(&m)) else {
+            return false;
+        };
         self.disco
             .as_ref()
             .ok()
-            .and_then(|d| d.devices.lock().unwrap().get(&m).map(|x| x.last_seen.elapsed() < ONLINE_WINDOW))
+            .and_then(|d| {
+                d.devices
+                    .lock()
+                    .unwrap()
+                    .get(&m)
+                    .map(|x| x.last_seen.elapsed() < ONLINE_WINDOW)
+            })
             .unwrap_or(false)
     }
 
@@ -400,10 +461,10 @@ impl App {
     }
 
     fn open(&mut self, d: &Device, https: bool) {
-        if let Some(url) = d.info.web_url(https) {
-            if let Err(e) = open::that(&url) {
-                self.status = format!("Could not open {url}: {e}");
-            }
+        if let Some(url) = d.info.web_url(https)
+            && let Err(e) = open::that(&url)
+        {
+            self.status = format!("Could not open {url}: {e}");
         }
     }
 }
@@ -420,112 +481,128 @@ impl eframe::App for App {
         self.track_memtests(&devs);
         let sel = self.selected_device(&devs);
 
-        egui::Panel::top("toolbar").show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Devices, "Management");
-                ui.selectable_value(&mut self.tab, Tab::Wol, "Wake on LAN");
-                ui.separator();
-                match self.tab {
-                    Tab::Devices => {
-                        if ui.button("🔍 Search").clicked() {
-                            if let Ok(d) = &self.disco {
-                                d.clear();
-                            }
-                            self.selected = None;
-                            self.search();
-                        }
-                        ui.add_enabled_ui(sel.is_some(), |ui| {
-                            if ui.button("Connect").on_hover_text("Open DSM in your browser (HTTP)").clicked() {
-                                self.open(sel.as_ref().unwrap(), false);
-                            }
-                            if ui.button("Connect (HTTPS)").clicked() {
-                                self.open(sel.as_ref().unwrap(), true);
-                            }
-                            let running = sel.as_ref().is_some_and(|d| d.info.is_memtest_running());
-                            let b = ui
-                                .add_enabled(!running, egui::Button::new("Memory Test"))
-                                .on_hover_text("Reboot the NAS into Synology's memory diagnostic test")
-                                .on_disabled_hover_text("A memory test is already running");
-                            if b.clicked() {
-                                let d = sel.as_ref().unwrap();
-                                self.memtest = Some(MemTestDialog {
-                                    mac: d.info.mac.clone(),
-                                    name: d.info.name.clone(),
-                                    account: String::new(),
-                                    password: String::new(),
-                                    unencrypted: d.info.public_key.is_empty() || d.info.session_id.is_none(),
-                                    accept_unencrypted: false,
-                                    phase: MemTestPhase::Form,
-                                });
-                            }
-                            if ui.button("Set up WOL").on_hover_text("Remember this device for Wake on LAN").clicked() {
-                                self.add_to_wol(sel.as_ref().unwrap());
-                            }
-                            if ui.button("Copy IP").clicked() {
-                                if let Some(ip) = sel.as_ref().unwrap().info.ip {
-                                    ui.ctx().copy_text(ip.to_string());
+        egui::Panel::top("toolbar")
+            .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(10, 8)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    segmented(ui, &mut self.tab);
+                    ui.add_space(8.0);
+                    match self.tab {
+                        Tab::Devices => {
+                            if ui.button("Search").clicked() {
+                                if let Ok(d) = &self.disco {
+                                    d.clear();
                                 }
+                                self.selected = None;
+                                self.search();
                             }
-                        });
-                    }
-                    Tab::Wol => {
-                        if ui.button("➕ Add device…").clicked() {
-                            self.new_wol = Some(WolDevice {
-                                name: String::new(),
-                                mac: String::new(),
-                                ip: String::new(),
-                                target: String::new(),
-                                port: 9,
+                            ui.add_enabled_ui(sel.is_some(), |ui| {
+                                ui.menu_button("Connect", |ui| {
+                                    if ui.button("Open DSM (HTTP)").clicked() {
+                                        self.open(sel.as_ref().unwrap(), false);
+                                    }
+                                    if ui.button("Open DSM (HTTPS)").clicked() {
+                                        self.open(sel.as_ref().unwrap(), true);
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Open DSM in your browser (double-click a device does the same)");
+                                let running = sel.as_ref().is_some_and(|d| d.info.is_memtest_running());
+                                let b = ui
+                                    .add_enabled(!running, egui::Button::new("Memory Test"))
+                                    .on_hover_text("Reboot the NAS into Synology's memory diagnostic test")
+                                    .on_disabled_hover_text("A memory test is already running");
+                                if b.clicked() {
+                                    self.open_memtest(sel.as_ref().unwrap());
+                                }
+                                if ui
+                                    .button("Set up WOL")
+                                    .on_hover_text("Remember this device for Wake on LAN")
+                                    .clicked()
+                                {
+                                    self.add_to_wol(sel.as_ref().unwrap());
+                                }
                             });
                         }
-                        let w = self.wol_selected.and_then(|i| self.wol.get(i).cloned());
-                        ui.add_enabled_ui(w.is_some(), |ui| {
-                            if ui.button("⏻ Wake Up").clicked() {
-                                self.wake(w.as_ref().unwrap());
+                        Tab::Wol => {
+                            if ui.button("Add device…").clicked() {
+                                self.new_wol = Some(WolDevice {
+                                    name: String::new(),
+                                    mac: String::new(),
+                                    ip: String::new(),
+                                    target: String::new(),
+                                    port: 9,
+                                });
                             }
-                            if ui.button("Remove").clicked() {
-                                self.wol.remove(self.wol_selected.unwrap());
-                                self.wol_selected = None;
-                                self.save_wol();
-                            }
-                        });
+                            let w = self.wol_selected.and_then(|i| self.wol.get(i).cloned());
+                            ui.add_enabled_ui(w.is_some(), |ui| {
+                                if ui.button("Wake Up").clicked() {
+                                    self.wake(w.as_ref().unwrap());
+                                }
+                                if ui.button("Remove").clicked() {
+                                    self.wol.remove(self.wol_selected.unwrap());
+                                    self.wol_selected = None;
+                                    self.save_wol();
+                                }
+                            });
+                        }
                     }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let label = if self.show_help { "✕ Help" } else { "? Help" };
-                    if ui.selectable_label(self.show_help, label).on_hover_text("Show help (F1)").clicked() {
-                        self.show_help = !self.show_help;
-                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add(egui::Button::new("Help").selected(self.show_help))
+                            .on_hover_text("Show or hide help (F1)")
+                            .clicked()
+                        {
+                            self.show_help = !self.show_help;
+                        }
+                    });
                 });
             });
-            ui.add_space(4.0);
-        });
         if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
             self.show_help = !self.show_help;
         }
 
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(format!("{} device(s)", devs.len()));
-                ui.separator();
-                let msg = if self.status == "Searching…" && !devs.is_empty() { "" } else { self.status.as_str() };
-                ui.label(msg);
+        egui::Panel::bottom("status")
+            .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(10, 4)))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let n = if self.tab == Tab::Wol {
+                        self.wol.len()
+                    } else {
+                        devs.len()
+                    };
+                    let what = if self.tab == Tab::Wol { "saved device" } else { "device" };
+                    ui.label(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                    let msg = if self.status == "Searching…" && !devs.is_empty() {
+                        ""
+                    } else {
+                        self.status.as_str()
+                    };
+                    if !msg.is_empty() {
+                        ui.separator();
+                        ui.label(msg);
+                    }
+                });
             });
-        });
 
         if self.show_help {
             let code = sel.as_ref().and_then(|d| d.info.status_code);
             let tab = self.tab;
-            egui::Panel::right("help").resizable(true).default_size(340.0).size_range(260.0..=560.0).show(ui, |ui| {
-                help_panel(ui, tab, code)
-            });
+            egui::Panel::right("help")
+                .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(12, 6)))
+                .resizable(true)
+                .default_size(340.0)
+                .size_range(260.0..=560.0)
+                .show(ui, |ui| help_panel(ui, tab, code));
         }
 
         match self.tab {
             Tab::Devices => {
                 if let Some(d) = &sel {
-                    egui::Panel::bottom("details").resizable(false).show(ui, |ui| details(ui, &d.info));
+                    egui::Panel::bottom("details")
+                        .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(12, 8)))
+                        .resizable(false)
+                        .show(ui, |ui| details(ui, &d.info));
                 }
                 egui::CentralPanel::default().show(ui, |ui| self.device_table(ui, &devs));
             }
@@ -543,60 +620,111 @@ impl App {
         use egui_extras::{Column, TableBuilder};
         if devs.is_empty() {
             ui.centered_and_justified(|ui| {
-                ui.label(if self.disco.is_ok() { "Searching for Synology devices on your network…" } else { self.status.as_str() });
+                ui.label(if self.disco.is_ok() {
+                    "Searching for Synology devices on your network…"
+                } else {
+                    self.status.as_str()
+                });
             });
             return;
         }
         let mut open_req = None;
+        let mut action: Option<(Device, RowAction)> = None;
+        let pal = theme::palette(ui);
+        quiet_column_lines(ui);
         TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
-            .column(Column::initial(150.0).resizable(true))
-            .column(Column::initial(115.0).resizable(true))
-            .column(Column::initial(110.0).resizable(true))
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(150.0).at_least(80.0).resizable(true))
+            .column(Column::initial(115.0).at_least(80.0).resizable(true))
+            .column(Column::initial(230.0).at_least(110.0).resizable(true))
             .column(Column::initial(135.0).resizable(true))
             .column(Column::initial(80.0).resizable(true))
             .column(Column::initial(110.0).resizable(true))
             .column(Column::remainder())
-            .header(22.0, |mut h| {
-                for t in ["Server name", "IP address", "Status", "MAC address", "Model", "Version", "Serial no"] {
-                    h.col(|ui| {
-                        ui.strong(t);
-                    });
+            .header(ROW_H, |mut h| {
+                for t in [
+                    "Server name",
+                    "IP address",
+                    "Status",
+                    "MAC address",
+                    "Model",
+                    "Version",
+                    "Serial no",
+                ] {
+                    h.col(|ui| header_cell(ui, t));
                 }
             })
             .body(|mut body| {
                 for d in devs {
                     let n = &d.info;
-                    body.row(22.0, |mut row| {
+                    body.row(ROW_H, |mut row| {
                         row.set_selected(self.selected.as_deref() == Some(n.mac.as_str()));
                         let stale = d.last_seen.elapsed() > ONLINE_WINDOW;
-                        let cells = [
-                            n.name.clone(),
-                            n.ip.map(|i| i.to_string()).unwrap_or_default(),
-                            if stale { "Offline".into() } else { n.status() },
-                            n.mac.clone(),
-                            n.model.clone(),
-                            n.dsm_version(),
-                            n.serial.clone(),
-                        ];
-                        for c in cells {
-                            row.col(|ui| {
-                                ui.label(c);
-                            });
-                        }
+                        let (status, color) = if stale {
+                            ("Offline".to_string(), pal.gray)
+                        } else {
+                            (n.status(), status_color(pal, n.status_code))
+                        };
+                        row.col(|ui| cell(ui, &n.name));
+                        row.col(|ui| cell(ui, &n.ip.map(|i| i.to_string()).unwrap_or_default()));
+                        row.col(|ui| {
+                            status_dot(ui, color);
+                            cell(ui, &status);
+                        });
+                        row.col(|ui| cell(ui, &n.mac));
+                        row.col(|ui| cell(ui, &n.model));
+                        row.col(|ui| cell(ui, &n.dsm_version()));
+                        row.col(|ui| cell(ui, &n.serial));
                         let r = row.response();
-                        if r.clicked() {
+                        if r.clicked() || r.secondary_clicked() {
                             self.selected = Some(n.mac.clone());
                         }
                         if r.double_clicked() {
                             open_req = Some(d.clone());
                         }
+                        r.context_menu(|ui| {
+                            let mut pick = |a| action = Some((d.clone(), a));
+                            if ui.button("Open DSM (HTTP)").clicked() {
+                                pick(RowAction::Http);
+                            }
+                            if ui.button("Open DSM (HTTPS)").clicked() {
+                                pick(RowAction::Https);
+                            }
+                            ui.separator();
+                            if ui.button("Copy IP address").clicked() {
+                                pick(RowAction::CopyIp);
+                            }
+                            if ui.button("Copy MAC address").clicked() {
+                                pick(RowAction::CopyMac);
+                            }
+                            ui.separator();
+                            if ui.button("Set up WOL").clicked() {
+                                pick(RowAction::Wol);
+                            }
+                            if ui
+                                .add_enabled(!n.is_memtest_running(), egui::Button::new("Memory Test…"))
+                                .clicked()
+                            {
+                                pick(RowAction::MemTest);
+                            }
+                        });
                     });
                 }
             });
         if let Some(d) = open_req {
             self.open(&d, false);
+        }
+        if let Some((d, a)) = action {
+            match a {
+                RowAction::Http => self.open(&d, false),
+                RowAction::Https => self.open(&d, true),
+                RowAction::CopyIp => ui.ctx().copy_text(d.info.ip.map(|i| i.to_string()).unwrap_or_default()),
+                RowAction::CopyMac => ui.ctx().copy_text(d.info.mac.clone()),
+                RowAction::Wol => self.add_to_wol(&d),
+                RowAction::MemTest => self.open_memtest(&d),
+            }
         }
     }
 
@@ -613,34 +741,45 @@ impl App {
             return;
         }
         let mut wake_req = None;
+        let pal = theme::palette(ui);
+        quiet_column_lines(ui);
         let online: Vec<bool> = self.wol.iter().map(|w| self.is_online(&w.mac)).collect();
         TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
-            .column(Column::initial(170.0).resizable(true))
-            .column(Column::initial(140.0).resizable(true))
-            .column(Column::initial(120.0).resizable(true))
-            .column(Column::initial(140.0).resizable(true))
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .column(Column::initial(170.0).at_least(80.0).resizable(true))
+            .column(Column::initial(140.0).at_least(80.0).resizable(true))
+            .column(Column::initial(120.0).at_least(60.0).resizable(true))
+            .column(Column::initial(140.0).at_least(60.0).resizable(true))
             .column(Column::initial(50.0))
             .column(Column::remainder())
-            .header(22.0, |mut h| {
+            .header(ROW_H, |mut h| {
                 for t in ["Name", "MAC address", "Last IP", "Target", "Port", "Status"] {
-                    h.col(|ui| {
-                        ui.strong(t);
-                    });
+                    h.col(|ui| header_cell(ui, t));
                 }
             })
             .body(|mut body| {
                 for (i, w) in self.wol.iter().enumerate() {
-                    body.row(22.0, |mut row| {
+                    body.row(ROW_H, |mut row| {
                         row.set_selected(self.wol_selected == Some(i));
-                        let st = if online[i] { "On" } else { "Off / unknown" };
-                        let target = if w.target.is_empty() { "Local network".to_string() } else { w.target.clone() };
-                        for c in [w.name.clone(), w.mac.clone(), w.ip.clone(), target, w.port.to_string(), st.into()] {
-                            row.col(|ui| {
-                                ui.label(c);
-                            });
+                        let (st, color) = if online[i] {
+                            ("On", pal.green)
+                        } else {
+                            ("Off / unknown", pal.gray)
+                        };
+                        let target = if w.target.is_empty() {
+                            "Local network".to_string()
+                        } else {
+                            w.target.clone()
+                        };
+                        for c in [w.name.clone(), w.mac.clone(), w.ip.clone(), target, w.port.to_string()] {
+                            row.col(|ui| cell(ui, &c));
                         }
+                        row.col(|ui| {
+                            status_dot(ui, color);
+                            cell(ui, st);
+                        });
                         let r = row.response();
                         if r.clicked() {
                             self.wol_selected = Some(i);
@@ -661,37 +800,31 @@ impl App {
         let mut close = false;
         let mut add = false;
         let valid = wol::parse_mac(&w.mac);
-        let modal = egui::Modal::new(egui::Id::unique("addwol")).show(ctx, |ui| {
-            ui.set_width(380.0);
+        let modal = egui::Modal::new(egui::Id::unique("addwol")).frame(dialog_frame(ctx)).show(ctx, |ui| {
+            ui.set_width(400.0);
             ui.heading("Add a device for Wake on LAN");
-            ui.add_space(8.0);
+            ui.add_space(10.0);
             egui::Grid::new("addwol_form").num_columns(2).spacing([10.0, 8.0]).show(ui, |ui| {
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut w.name).hint_text("My NAS").desired_width(220.0));
+                let l = ui.label("Name");
+                ui.add(egui::TextEdit::singleline(&mut w.name).hint_text("My NAS").desired_width(220.0)).labelled_by(l.id);
                 ui.end_row();
-                ui.label("MAC address");
-                ui.add(egui::TextEdit::singleline(&mut w.mac).hint_text("00:11:32:xx:xx:xx").desired_width(220.0));
+                let l = ui.label("MAC address");
+                ui.add(egui::TextEdit::singleline(&mut w.mac).hint_text("00:11:32:xx:xx:xx").desired_width(220.0)).labelled_by(l.id);
                 ui.end_row();
-                ui.label("Target");
+                let l = ui.label("Target");
                 ui.add(egui::TextEdit::singleline(&mut w.target).hint_text("Optional").desired_width(220.0))
+                    .labelled_by(l.id)
                     .on_hover_text("Leave empty for the local network. For remote wake-up: a directed broadcast (192.168.1.255) or a host name with UDP forwarding.");
                 ui.end_row();
-                ui.label("Port");
-                ui.add(egui::DragValue::new(&mut w.port).range(1..=65535));
+                let l = ui.label("Port");
+                ui.add(egui::DragValue::new(&mut w.port).range(1..=65535)).labelled_by(l.id);
                 ui.end_row();
             });
             if !w.mac.trim().is_empty() && valid.is_none() {
                 ui.colored_label(ui.visuals().error_fg_color, "Enter a MAC address like 00:11:32:12:34:56.");
             }
-            ui.add_space(10.0);
-            ui.horizontal(|ui| {
-                if ui.add_enabled(valid.is_some(), egui::Button::new("Add")).clicked() {
-                    add = true;
-                }
-                if ui.button("Cancel").clicked() {
-                    close = true;
-                }
-            });
+            ui.add_space(12.0);
+            dialog_buttons(ui, "Add", valid.is_some(), &mut add, &mut close);
         });
         if modal.should_close() {
             close = true;
@@ -711,6 +844,117 @@ impl App {
     }
 }
 
+const ROW_H: f32 = 28.0;
+
+/// Two-segment tab switcher (Management / Wake on LAN).
+fn segmented(ui: &mut egui::Ui, tab: &mut Tab) {
+    let pal = theme::palette(ui);
+    egui::Frame::new()
+        .fill(pal.control_active)
+        .corner_radius(8)
+        .inner_margin(egui::Margin::same(2))
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for (t, label) in [(Tab::Devices, "Management"), (Tab::Wol, "Wake on LAN")] {
+                let on = *tab == t;
+                let text = egui::RichText::new(label).color(if on { pal.text } else { pal.text_secondary });
+                let b = egui::Button::new(text)
+                    .fill(if on { pal.control } else { egui::Color32::TRANSPARENT })
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(6);
+                if ui.add(b).clicked() {
+                    *tab = t;
+                }
+            }
+        });
+}
+
+/// Column dividers only appear while hovering/resizing, like macOS tables.
+fn quiet_column_lines(ui: &mut egui::Ui) {
+    ui.visuals_mut().widgets.noninteractive.bg_stroke.color = egui::Color32::TRANSPARENT;
+}
+
+fn header_cell(ui: &mut egui::Ui, text: &str) {
+    let pal = theme::palette(ui);
+    let rect = ui.max_rect();
+    let x = rect.x_range().expand(ui.spacing().item_spacing.x);
+    ui.painter()
+        .hline(x, rect.bottom(), egui::Stroke::new(1.0, pal.separator));
+    ui.add(
+        egui::Label::new(egui::RichText::new(text).color(pal.text_secondary).strong())
+            .truncate()
+            .selectable(false),
+    );
+}
+
+fn primary_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> egui::Response {
+    let pal = theme::palette(ui);
+    let b = egui::Button::new(egui::RichText::new(text).color(egui::Color32::WHITE))
+        .fill(pal.accent)
+        .stroke(egui::Stroke::NONE);
+    ui.add_enabled(enabled, b)
+}
+
+/// macOS-style dialog buttons: primary action on the right, Cancel to its left.
+fn dialog_buttons(ui: &mut egui::Ui, primary: &str, enabled: bool, ok: &mut bool, cancel: &mut bool) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if primary_button(ui, primary, enabled).clicked() {
+            *ok = true;
+        }
+        if ui.button("Cancel").clicked() {
+            *cancel = true;
+        }
+    });
+}
+
+fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
+    egui::Frame::popup(&ctx.global_style())
+        .inner_margin(egui::Margin::same(20))
+        .corner_radius(12)
+}
+
+#[derive(Clone, Copy)]
+enum RowAction {
+    Http,
+    Https,
+    CopyIp,
+    CopyMac,
+    Wol,
+    MemTest,
+}
+
+/// Single-line table cell: never wraps, shows "…" and the full text on hover when too long.
+fn cell(ui: &mut egui::Ui, text: &str) {
+    let r = ui.add(egui::Label::new(text).truncate().selectable(false));
+    if r.hovered()
+        && ui.fonts_mut(|f| {
+            f.layout_no_wrap(
+                text.to_string(),
+                egui::TextStyle::Body.resolve(ui.style()),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x
+        }) > r.rect.width() + 0.5
+    {
+        r.on_hover_text(text);
+    }
+}
+
+fn status_dot(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 4.0, color);
+}
+
+fn status_color(p: &theme::Palette, code: Option<u32>) -> egui::Color32 {
+    match code {
+        Some(1) => p.green,
+        Some(3 | 5 | 6 | 7 | 9 | 13) => p.orange,
+        Some(0 | 2 | 4 | 11 | 14) => p.red,
+        _ => p.gray,
+    }
+}
+
 fn help_panel(ui: &mut egui::Ui, tab: Tab, selected_status: Option<u32>) {
     egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
         ui.add_space(6.0);
@@ -724,21 +968,25 @@ fn help_panel(ui: &mut egui::Ui, tab: Tab, selected_status: Option<u32>) {
             ui.add_space(6.0);
         }
         let section = |ui: &mut egui::Ui, s: &help::Section, open: bool| {
-            egui::CollapsingHeader::new(egui::RichText::new(s.title).strong()).default_open(open).show(ui, |ui| {
-                for p in s.body {
-                    ui.label(*p);
+            egui::CollapsingHeader::new(egui::RichText::new(s.title).strong())
+                .default_open(open)
+                .show(ui, |ui| {
+                    for p in s.body {
+                        ui.label(*p);
+                        ui.add_space(4.0);
+                    }
+                });
+        };
+        section(ui, &help::GETTING_STARTED, tab == Tab::Devices);
+        egui::CollapsingHeader::new(egui::RichText::new("Device status").strong())
+            .default_open(false)
+            .show(ui, |ui| {
+                for (name, code) in help::STATUSES {
+                    ui.label(egui::RichText::new(*name).strong());
+                    ui.label(help::status_explanation(Some(*code)));
                     ui.add_space(4.0);
                 }
             });
-        };
-        section(ui, &help::GETTING_STARTED, tab == Tab::Devices);
-        egui::CollapsingHeader::new(egui::RichText::new("Device status").strong()).default_open(false).show(ui, |ui| {
-            for (name, code) in help::STATUSES {
-                ui.label(egui::RichText::new(*name).strong());
-                ui.label(help::status_explanation(Some(*code)));
-                ui.add_space(4.0);
-            }
-        });
         section(ui, &help::WOL, tab == Tab::Wol);
         section(ui, &help::MEMTEST, false);
         section(ui, &help::TROUBLESHOOTING, false);
@@ -750,43 +998,150 @@ fn help_panel(ui: &mut egui::Ui, tab: Tab, selected_status: Option<u32>) {
 
 fn details(ui: &mut egui::Ui, n: &protocol::NasInfo) {
     let ip = |a: Option<std::net::Ipv4Addr>| a.map(|x| x.to_string()).unwrap_or_else(|| "–".into());
-    ui.add_space(4.0);
-    egui::Grid::new("details").num_columns(4).spacing([24.0, 4.0]).show(ui, |ui| {
-        ui.strong("Server name");
-        ui.label(&n.name);
-        ui.strong("Model");
-        ui.label(format!("{} ({})", n.model, n.unique));
-        ui.end_row();
-        ui.strong("IP address");
-        ui.label(format!(
-            "{}{}",
-            ip(n.ip),
-            match n.dhcp {
-                Some(true) => "  (DHCP)",
-                Some(false) => "  (static)",
-                None => "",
+    let key_color = theme::palette(ui).text_secondary;
+    let key = |ui: &mut egui::Ui, t: &str| {
+        ui.label(egui::RichText::new(t).color(key_color));
+    };
+    ui.add_space(2.0);
+    egui::Grid::new("details")
+        .num_columns(4)
+        .spacing([24.0, 4.0])
+        .show(ui, |ui| {
+            key(ui, "Server name");
+            ui.label(&n.name);
+            key(ui, "Model");
+            ui.label(format!("{} ({})", n.model, n.unique));
+            ui.end_row();
+            key(ui, "IP address");
+            ui.label(format!(
+                "{}{}",
+                ip(n.ip),
+                match n.dhcp {
+                    Some(true) => "  (DHCP)",
+                    Some(false) => "  (static)",
+                    None => "",
+                }
+            ));
+            key(ui, "Operating system");
+            ui.label(format!("{} {}", n.os_name, n.dsm_version()));
+            ui.end_row();
+            key(ui, "Subnet mask");
+            ui.label(ip(n.netmask));
+            key(ui, "Status");
+            ui.label(n.status())
+                .on_hover_text(help::status_explanation(n.status_code));
+            ui.end_row();
+            key(ui, "Gateway");
+            ui.label(ip(n.gateway));
+            key(ui, "Serial no");
+            ui.label(&n.serial);
+            ui.end_row();
+            key(ui, "DNS");
+            ui.label(ip(n.dns));
+            key(ui, "Web");
+            if let Some(u) = n.web_url(false) {
+                ui.hyperlink(u);
             }
-        ));
-        ui.strong("Operating system");
-        ui.label(format!("{} {}", n.os_name, n.dsm_version()));
-        ui.end_row();
-        ui.strong("Subnet mask");
-        ui.label(ip(n.netmask));
-        ui.strong("Status");
-        ui.label(n.status()).on_hover_text(help::status_explanation(n.status_code));
-        ui.end_row();
-        ui.strong("Gateway");
-        ui.label(ip(n.gateway));
-        ui.strong("Serial no");
-        ui.label(&n.serial);
-        ui.end_row();
-        ui.strong("DNS");
-        ui.label(ip(n.dns));
-        ui.strong("Web");
-        if let Some(u) = n.web_url(false) {
-            ui.hyperlink(u);
-        }
-        ui.end_row();
-    });
+            ui.end_row();
+        });
     ui.add_space(4.0);
+}
+
+/// Renders the UI to PNGs in target/ui-shots for visual review:
+/// `cargo test --release ui_snapshots -- --ignored`
+#[cfg(test)]
+mod ui_snapshots {
+    use super::*;
+    use egui_kittest::Harness;
+    use protocol::NasInfo;
+
+    fn dev(name: &str, ip: u8, code: u32, progress: Option<u32>, model: &str) -> Device {
+        Device {
+            info: NasInfo {
+                packet_type: protocol::PKT_INFO,
+                name: name.into(),
+                mac: format!("00:11:32:00:00:{ip:02x}"),
+                ip: Some(std::net::Ipv4Addr::new(192, 168, 1, ip)),
+                netmask: Some(std::net::Ipv4Addr::new(255, 255, 255, 0)),
+                gateway: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                dns: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                dhcp: Some(true),
+                model: model.into(),
+                unique: "synology_geminilake_220+".into(),
+                os_name: "DSM".into(),
+                version: "7.4.1".into(),
+                build: Some(90080),
+                serial: "0000ABCDEFGHI".into(),
+                status_code: Some(code),
+                progress,
+                public_key: "00".repeat(32),
+                session_id: Some(1),
+                ..Default::default()
+            },
+            last_seen: Instant::now(),
+        }
+    }
+
+    fn shot(theme: egui::Theme, name: &str, setup: impl FnOnce(&mut App)) {
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 560.0))
+            .with_pixels_per_point(2.0)
+            .with_theme(theme)
+            .build_eframe(|cc| {
+                let mut app = App::build(cc, Err("test".into()));
+                app.fake_devices = Some(vec![
+                    dev("DS220plus", 15, 9, Some(7536), "DS220+"),
+                    dev("backup-nas", 20, 1, None, "DS923+"),
+                    dev("new-box", 30, 2, None, "DS224+"),
+                ]);
+                app.status.clear();
+                app
+            });
+        setup(h.state_mut());
+        h.run();
+        let img = h.render().expect("render");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        img.save(dir.join(format!("{name}.png"))).unwrap();
+    }
+
+    #[test]
+    #[ignore = "renders PNGs for manual review"]
+    fn ui_snapshots() {
+        for (t, tn) in [(egui::Theme::Light, "light"), (egui::Theme::Dark, "dark")] {
+            shot(t, &format!("{tn}-devices"), |a| {
+                a.selected = Some("00:11:32:00:00:0f".into())
+            });
+            shot(t, &format!("{tn}-help"), |a| {
+                a.selected = Some("00:11:32:00:00:0f".into());
+                a.show_help = true;
+            });
+            shot(t, &format!("{tn}-wol"), |a| {
+                a.tab = Tab::Wol;
+                a.wol = vec![WolDevice {
+                    name: "DS220plus".into(),
+                    mac: "00:11:32:00:00:0f".into(),
+                    ip: "192.168.1.15".into(),
+                    target: String::new(),
+                    port: 9,
+                }];
+            });
+            shot(t, &format!("{tn}-addwol"), |a| {
+                a.tab = Tab::Wol;
+                a.wol.clear();
+                a.new_wol = Some(WolDevice {
+                    name: String::new(),
+                    mac: "00:11".into(),
+                    ip: String::new(),
+                    target: String::new(),
+                    port: 9,
+                });
+            });
+            shot(t, &format!("{tn}-memtest"), |a| {
+                a.selected = Some("00:11:32:00:00:14".into());
+                let d = a.fake_devices.as_ref().unwrap()[1].clone();
+                a.open_memtest(&d);
+            });
+        }
+    }
 }

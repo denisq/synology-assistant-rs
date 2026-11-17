@@ -25,7 +25,9 @@ fn default_port() -> u16 {
 
 pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    let sep_ok = s.chars().all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '-' | '.' | ' '));
+    let sep_ok = s
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '-' | '.' | ' '));
     if hex.len() != 12 || !sep_ok {
         return None;
     }
@@ -51,8 +53,7 @@ pub fn magic_packet(mac: &[u8; 6]) -> Vec<u8> {
 /// Send the magic packet to every broadcast address (and the explicit target, if any),
 /// on the configured port and on port 7 as well.
 pub fn wake(dev: &WolDevice) -> io::Result<usize> {
-    let mac = parse_mac(&dev.mac)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid MAC address"))?;
+    let mac = parse_mac(&dev.mac).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid MAC address"))?;
     let pkt = magic_packet(&mac);
     let sock = UdpSocket::bind("0.0.0.0:0")?;
     sock.set_broadcast(true)?;

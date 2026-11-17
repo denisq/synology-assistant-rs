@@ -202,7 +202,9 @@ impl NasInfo {
     /// Code table recovered from `CAsstNasinfoModel::getServerStatus`; while a
     /// memory test runs the NAS reports code 9 with progress in hundredths of a percent.
     pub fn status(&self) -> String {
-        let Some(code) = self.status_code else { return "Unknown".into() };
+        let Some(code) = self.status_code else {
+            return "Unknown".into();
+        };
         let pct = self.progress.map(|p| format!("{}.{:02}%", p / 100, p % 100));
         match code {
             0 => "Not configured".into(),
@@ -235,12 +237,28 @@ impl NasInfo {
     }
 }
 
+/// Meaning of the result code in the memory-test acknowledgement
+/// (`CAsstWizardMemTest::slotPktRecvReboot`).
+pub fn memtest_result_message(code: u32) -> Result<(), &'static str> {
+    match code {
+        0 => Ok(()),
+        1 => Err("The account or password is invalid. Please try again."),
+        6 => Err("You are not authorized to use this service (login blocked)."),
+        8 => Err("The user account has been disabled."),
+        9 => Err("Please enter an administrator account."),
+        _ => Err("The NAS refused to start the memory test."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     /// Real reply from a DS220+ (DSM 7.4.1-90080) during a memory test.
@@ -248,7 +266,10 @@ mod tests {
 
     #[test]
     fn query_matches_original_app() {
-        assert_eq!(build_query(None), hex("1234567853594e4fa40400000201a60478000000010401000000"));
+        assert_eq!(
+            build_query(None),
+            hex("1234567853594e4fa40400000201a60478000000010401000000")
+        );
     }
 
     #[test]
@@ -296,18 +317,5 @@ mod tests {
         let n = parse(&p).unwrap();
         assert_eq!(n.name, "DS220plus");
         assert!(!n.is_device_info());
-    }
-}
-
-/// Meaning of the result code in the memory-test acknowledgement
-/// (`CAsstWizardMemTest::slotPktRecvReboot`).
-pub fn memtest_result_message(code: u32) -> Result<(), &'static str> {
-    match code {
-        0 => Ok(()),
-        1 => Err("The account or password is invalid. Please try again."),
-        6 => Err("You are not authorized to use this service (login blocked)."),
-        8 => Err("The user account has been disabled."),
-        9 => Err("Please enter an administrator account."),
-        _ => Err("The NAS refused to start the memory test."),
     }
 }

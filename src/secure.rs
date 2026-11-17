@@ -28,7 +28,10 @@ impl Session {
         while id == 0 {
             id = OsRng.next_u32();
         }
-        Self { secret: SecretKey::generate(&mut OsRng), id }
+        Self {
+            secret: SecretKey::generate(&mut OsRng),
+            id,
+        }
     }
 
     pub fn public_hex(&self) -> String {
@@ -58,10 +61,13 @@ pub fn hex(b: &[u8]) -> String {
 
 pub fn unhex(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 #[cfg(test)]

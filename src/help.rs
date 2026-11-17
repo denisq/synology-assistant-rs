@@ -6,16 +6,26 @@ pub fn status_explanation(code: Option<u32>) -> &'static str {
     match code {
         Some(0) => "DSM is installed but its first-time setup (admin account) is unfinished. Connect to finish it.",
         Some(1) => "DSM is installed and running. Double-click the device or use Connect to open it.",
-        Some(2) => "No usable DSM was found: drives missing or not detected, DSM never installed, or the system was erased. If drives were in use before, stop and check them before installing anything.",
+        Some(2) => {
+            "No usable DSM was found: drives missing or not detected, DSM never installed, or the system was erased. If drives were in use before, stop and check them before installing anything."
+        }
         Some(3) => "DSM is being updated. Wait for it to finish; don't power it off.",
-        Some(4) => "The settings were reset (typically a 4-second reset-button press, \"mode 2\"). Reinstall DSM from the web page; data on the volumes is kept.",
+        Some(4) => {
+            "The settings were reset (typically a 4-second reset-button press, \"mode 2\"). Reinstall DSM from the web page; data on the volumes is kept."
+        }
         Some(5) => "The system is booting.",
         Some(6) => "Drive quotas are being checked, often after an improper shutdown.",
         Some(7) => "DSM services are starting; this can take up to about 10 minutes.",
-        Some(9) => "A memory test is running; the NAS is not usable until it finishes. Results are written to the DSM system log.",
-        Some(11) => "The DSM version on the drives is newer than the one on the device (common after a repair or replacement). Connect to recover.",
+        Some(9) => {
+            "A memory test is running; the NAS is not usable until it finishes. Results are written to the DSM system log."
+        }
+        Some(11) => {
+            "The DSM version on the drives is newer than the one on the device (common after a repair or replacement). Connect to recover."
+        }
         Some(13) => "DSM is being installed or configured.",
-        Some(14) => "The drives come from another, compatible device and can be migrated. Connect to start the migration.",
+        Some(14) => {
+            "The drives come from another, compatible device and can be migrated. Connect to start the migration."
+        }
         _ => "This status is not documented.",
     }
 }

@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)] // index loops read clearer for matrix math
 //! `MatrixEncode` from the original app: the obfuscation Synology Assistant applies
 //! to the admin password before putting it in a findhost packet.
 //!
