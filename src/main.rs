@@ -5,12 +5,26 @@ mod theme;
 
 use discovery::{Device, Discovery};
 use eframe::egui;
+use protocol::NasInfo;
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
-use synology_assistant_rs::{discovery, help, protocol, wol};
+use synology_assistant_rs::{discovery, help, known, memtest, net, protocol, store, wol};
 use wol::WolDevice;
 
 const AUTO_SEARCH: Duration = Duration::from_secs(10);
 const ONLINE_WINDOW: Duration = Duration::from_secs(35);
+/// How long "Wake Up" keeps waiting for the device to answer.
+const WAKE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// One line of the device list: a device answering now, or one remembered from before.
+#[derive(Clone)]
+struct Row {
+    info: NasInfo,
+    online: bool,
+    /// Unix seconds.
+    last_seen: u64,
+}
 
 #[cfg(windows)]
 fn attach_console() {
@@ -134,8 +148,19 @@ struct App {
     fake_devices: Option<Vec<Device>>,
     status: String,
     memtest: Option<MemTestDialog>,
-    /// Devices seen running a memory test in this session (to report the result).
-    testing: std::collections::HashSet<String>,
+    /// Memory-test runs per device (persisted).
+    history: memtest::History,
+    /// Devices seen before (persisted), shown greyed out while offline.
+    known: known::KnownDevices,
+    /// Last time the persisted files were written.
+    saved_at: Instant,
+    dirty: bool,
+    /// This computer's networks, to warn about a NAS on another subnet.
+    local_nets: Vec<(Ipv4Addr, Ipv4Addr)>,
+    /// Devices we sent a wake-up to: MAC -> (when, name).
+    waking: HashMap<String, (Instant, String)>,
+    /// False in UI tests: no files written, no notifications.
+    live: bool,
 }
 
 enum MemTestPhase {
@@ -218,7 +243,14 @@ impl App {
                 protocol::PORT
             )
         });
-        Self::build(cc, disco)
+        let mut app = Self::build(cc, disco);
+        app.live = true;
+        app.history = memtest::History::load();
+        app.known = known::KnownDevices::load();
+        app.local_nets = net::local_networks();
+        #[cfg(target_os = "macos")]
+        let _ = notify_rust::set_application("io.github.denisq.synology-assistant-rs");
+        app
     }
 
     fn build(cc: &eframe::CreationContext<'_>, disco: Result<Discovery, String>) -> Self {
@@ -240,27 +272,98 @@ impl App {
             fake_devices: None,
             status,
             memtest: None,
-            testing: Default::default(),
+            history: Default::default(),
+            known: Default::default(),
+            saved_at: Instant::now(),
+            dirty: false,
+            local_nets: Vec::new(),
+            waking: HashMap::new(),
+            live: false,
         }
     }
 
-    /// Report the outcome when a device we saw testing leaves the test mode,
-    /// the way the original app does (field 0x79 non-zero = errors found).
-    fn track_memtests(&mut self, devs: &[Device]) {
-        for d in devs {
+    /// Desktop notification plus a Dock/taskbar bounce. Never blocks the UI.
+    fn notify(&self, ctx: &egui::Context, title: &str, body: &str) {
+        if !self.live {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+            egui::UserAttentionType::Informational,
+        ));
+        let (title, body) = (title.to_string(), body.to_string());
+        std::thread::spawn(move || {
+            let _ = notify_rust::Notification::new()
+                .appname("Synology Assistant")
+                .summary(&title)
+                .body(&body)
+                .show();
+        });
+    }
+
+    /// Update remembered devices, memory-test history and pending wake-ups from
+    /// what is on the network right now.
+    fn track(&mut self, ctx: &egui::Context, live: &[Device]) {
+        let now = store::now();
+        for d in live.iter().filter(|d| d.last_seen.elapsed() < ONLINE_WINDOW) {
             let n = &d.info;
-            if n.is_memtest_running() {
-                self.testing.insert(n.mac.clone());
-            } else if self.testing.remove(&n.mac) {
-                self.status = if n.progress.unwrap_or(0) != 0 {
-                    format!(
-                        "{}: one or more errors have been found by the memory diagnostic test.",
-                        n.name
-                    )
-                } else {
-                    format!("{}: memory test finished, no errors were found.", n.name)
-                };
+            let prev = self
+                .known
+                .devices
+                .get(&n.mac)
+                .map(|k| (k.info.status_code, k.info.progress));
+            self.known.seen(n, now);
+            if prev != Some((n.status_code, n.progress)) {
+                self.dirty = true;
             }
+            if let memtest::Event::Finished(outcome) = self.history.observe(n, now) {
+                self.dirty = true;
+                let (title, body) = match outcome {
+                    memtest::Outcome::NoErrors => (
+                        format!("{}: memory test passed", n.name),
+                        "No errors were found. Details are in the DSM system log.".to_string(),
+                    ),
+                    memtest::Outcome::Errors => (
+                        format!("{}: memory errors found", n.name),
+                        "One or more errors were found. Check the DSM system log and contact Synology support."
+                            .to_string(),
+                    ),
+                };
+                self.status = format!("{title}. {body}");
+                self.notify(ctx, &title, &body);
+            }
+            if let Some((_, name)) = self.waking.remove(&n.mac) {
+                let msg = format!("{name} is awake");
+                self.status = format!("{msg}. Double-click it to open DSM.");
+                self.notify(ctx, &msg, "It answered on the network.");
+            }
+        }
+        let expired: Vec<String> = self
+            .waking
+            .iter()
+            .filter(|(_, (t, _))| t.elapsed() > WAKE_TIMEOUT)
+            .map(|(m, _)| m.clone())
+            .collect();
+        for m in expired {
+            if let Some((_, name)) = self.waking.remove(&m) {
+                self.status = format!(
+                    "{name} did not answer within 5 minutes. Check that Wake on LAN is enabled in DSM and that it is plugged in."
+                );
+            }
+        }
+        if self.live && self.dirty && self.saved_at.elapsed() > Duration::from_secs(30) {
+            let _ = self.known.save();
+            let _ = self.history.save();
+            self.dirty = false;
+            self.saved_at = Instant::now();
+        }
+    }
+
+    fn save_now(&mut self) {
+        if self.live {
+            let _ = self.known.save();
+            let _ = self.history.save();
+            self.dirty = false;
+            self.saved_at = Instant::now();
         }
     }
 
@@ -272,10 +375,16 @@ impl App {
             match disco.and_then(|d| d.ack(&dlg.mac)) {
                 Some((code, _)) => {
                     dlg.phase = MemTestPhase::Done(match protocol::memtest_result_message(code) {
-                        Ok(()) => Ok(format!(
-                            "{} is rebooting into the memory test. Progress appears in the Status column; this can take hours.",
-                            dlg.name
-                        )),
+                        Ok(()) => {
+                            self.history.started(&dlg.mac, &dlg.name, store::now());
+                            self.dirty = true;
+                            self.saved_at = Instant::now() - Duration::from_secs(60);
+                            Ok(format!(
+                                "{} is rebooting into the memory test. Progress and an estimate of the time left \
+                                 appear in the Status column; you'll get a notification when it finishes.",
+                                dlg.name
+                            ))
+                        }
                         Err(m) => Err(m.to_string()),
                     })
                 }
@@ -381,13 +490,20 @@ impl App {
         }
     }
 
-    fn open_memtest(&mut self, d: &Device) {
+    fn open_memtest(&mut self, n: &NasInfo) {
+        // Use the live record: it carries the session key the remembered copy lacks.
+        let live = self
+            .disco
+            .as_ref()
+            .ok()
+            .and_then(|d| d.devices.lock().unwrap().get(&n.mac).map(|x| x.info.clone()));
+        let n = live.as_ref().unwrap_or(n);
         self.memtest = Some(MemTestDialog {
-            mac: d.info.mac.clone(),
-            name: d.info.name.clone(),
+            mac: n.mac.clone(),
+            name: n.name.clone(),
             account: String::new(),
             password: String::new(),
-            unencrypted: d.info.public_key.is_empty() || d.info.session_id.is_none(),
+            unencrypted: n.public_key.is_empty() || n.session_id.is_none(),
             accept_unencrypted: false,
             phase: MemTestPhase::Form,
         });
@@ -397,38 +513,93 @@ impl App {
         if let Ok(d) = &self.disco {
             d.search();
             self.last_search = Some(Instant::now());
+            if self.live {
+                self.local_nets = net::local_networks();
+            }
         }
     }
 
-    fn devices(&self) -> Vec<Device> {
-        let mut v = match &self.fake_devices {
+    fn live_devices(&self) -> Vec<Device> {
+        match &self.fake_devices {
             Some(f) => f.clone(),
             None => self.disco.as_ref().map(|d| d.snapshot()).unwrap_or_default(),
-        };
-        v.sort_by_key(|a| a.info.name.to_lowercase());
-        v
+        }
     }
 
-    fn selected_device(&self, devs: &[Device]) -> Option<Device> {
+    /// Devices answering now, plus remembered ones that are offline.
+    fn rows(&self, live: &[Device]) -> Vec<Row> {
+        let now = store::now();
+        let mut rows: Vec<Row> = live
+            .iter()
+            .map(|d| Row {
+                info: d.info.clone(),
+                online: d.last_seen.elapsed() < ONLINE_WINDOW,
+                last_seen: now.saturating_sub(d.last_seen.elapsed().as_secs()),
+            })
+            .collect();
+        for k in self.known.devices.values() {
+            if !rows.iter().any(|r| r.info.mac == k.info.mac) {
+                rows.push(Row {
+                    info: k.info.clone(),
+                    online: false,
+                    last_seen: k.last_seen,
+                });
+            }
+        }
+        rows.sort_by_key(|r| (!r.online, r.info.name.to_lowercase()));
+        rows
+    }
+
+    fn selected_row(&self, rows: &[Row]) -> Option<Row> {
         let mac = self.selected.as_ref()?;
-        devs.iter().find(|d| &d.info.mac == mac).cloned()
+        rows.iter().find(|r| &r.info.mac == mac).cloned()
+    }
+
+    /// Status text with the memory-test estimate appended.
+    fn status_text(&self, r: &Row) -> String {
+        if !r.online {
+            return format!("Offline · seen {}", store::ago(r.last_seen, store::now()));
+        }
+        let n = &r.info;
+        if !n.is_memtest_running() {
+            return n.status();
+        }
+        let p = n.progress.unwrap_or(0);
+        let mut s = format!("Memory test {}.{:02}%", p / 100, p % 100);
+        if let Some(left) = self.history.running(&n.mac).and_then(|h| h.remaining()) {
+            s.push_str(&format!(" · ~{} left", store::duration(left)));
+        }
+        s
+    }
+
+    fn wol_for(n: &NasInfo) -> WolDevice {
+        WolDevice {
+            name: n.name.clone(),
+            mac: n.mac.clone(),
+            ip: n.ip.map(|i| i.to_string()).unwrap_or_default(),
+            target: String::new(),
+            port: 9,
+        }
+    }
+
+    fn open_shares(&mut self, n: &NasInfo) {
+        let Some(ip) = n.ip else { return };
+        #[cfg(windows)]
+        let url = format!("\\\\{ip}\\");
+        #[cfg(not(windows))]
+        let url = format!("smb://{ip}");
+        if let Err(e) = open::that(&url) {
+            self.status = format!("Could not open {url}: {e}");
+        }
     }
 
     fn is_online(&self, mac: &str) -> bool {
         let Some(m) = wol::parse_mac(mac).map(|m| wol::format_mac(&m)) else {
             return false;
         };
-        self.disco
-            .as_ref()
-            .ok()
-            .and_then(|d| {
-                d.devices
-                    .lock()
-                    .unwrap()
-                    .get(&m)
-                    .map(|x| x.last_seen.elapsed() < ONLINE_WINDOW)
-            })
-            .unwrap_or(false)
+        self.live_devices()
+            .iter()
+            .any(|d| d.info.mac == m && d.last_seen.elapsed() < ONLINE_WINDOW)
     }
 
     fn save_wol(&mut self) {
@@ -437,31 +608,42 @@ impl App {
         }
     }
 
-    fn add_to_wol(&mut self, d: &Device) {
-        if self.wol.iter().any(|w| w.mac.eq_ignore_ascii_case(&d.info.mac)) {
-            self.status = format!("{} is already in the Wake-on-LAN list.", d.info.name);
+    fn add_to_wol(&mut self, n: &NasInfo) {
+        if self.wol.iter().any(|w| w.mac.eq_ignore_ascii_case(&n.mac)) {
+            self.status = format!("{} is already in the Wake-on-LAN list.", n.name);
             return;
         }
-        self.wol.push(WolDevice {
-            name: d.info.name.clone(),
-            mac: d.info.mac.clone(),
-            ip: d.info.ip.map(|i| i.to_string()).unwrap_or_default(),
-            target: String::new(),
-            port: 9,
-        });
+        self.wol.push(Self::wol_for(n));
         self.save_wol();
-        self.status = format!("Added {} to the Wake-on-LAN list.", d.info.name);
+        self.status = format!("Added {} to the Wake-on-LAN list.", n.name);
     }
 
     fn wake(&mut self, w: &WolDevice) {
-        self.status = match wol::wake(w) {
-            Ok(_) => format!("Wake-up packet sent to {} ({}).", w.name, w.mac),
-            Err(e) => format!("Wake-up failed for {}: {e}", w.name),
-        };
+        if self.is_online(&w.mac) {
+            self.status = format!("{} is already on.", w.name);
+            return;
+        }
+        match wol::wake(w) {
+            Ok(_) => {
+                let mac = wol::parse_mac(&w.mac).map(|m| wol::format_mac(&m)).unwrap_or_default();
+                self.waking.insert(mac, (Instant::now(), w.name.clone()));
+                self.status = format!("Waking {}… this usually takes 1–3 minutes.", w.name);
+                // Search more often while waiting.
+                self.last_search = None;
+            }
+            Err(e) => self.status = format!("Wake-up failed for {}: {e}", w.name),
+        }
     }
 
-    fn open(&mut self, d: &Device, https: bool) {
-        if let Some(url) = d.info.web_url(https)
+    fn waking_label(&self, mac: &str) -> Option<String> {
+        let m = wol::parse_mac(mac).map(|m| wol::format_mac(&m))?;
+        let (t, _) = self.waking.get(&m)?;
+        let s = t.elapsed().as_secs();
+        Some(format!("Waking… {}:{:02}", s / 60, s % 60))
+    }
+
+    fn open(&mut self, n: &NasInfo, https: bool) {
+        if let Some(url) = n.web_url(https)
             && let Err(e) = open::that(&url)
         {
             self.status = format!("Could not open {url}: {e}");
@@ -477,9 +659,14 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_secs(1));
 
-        let devs = self.devices();
-        self.track_memtests(&devs);
-        let sel = self.selected_device(&devs);
+        let live = self.live_devices();
+        self.track(&ctx, &live);
+        let devs = self.rows(&live);
+        let sel = self.selected_row(&devs);
+        // Search every 3 s while waiting for a device to wake up.
+        if !self.waking.is_empty() && self.last_search.is_some_and(|t| t.elapsed() >= Duration::from_secs(3)) {
+            self.search();
+        }
 
         egui::Panel::top("toolbar")
             .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(10, 8)))
@@ -497,30 +684,49 @@ impl eframe::App for App {
                                 self.search();
                             }
                             ui.add_enabled_ui(sel.is_some(), |ui| {
+                                let n = sel.as_ref().map(|r| r.info.clone()).unwrap_or_default();
                                 ui.menu_button("Connect", |ui| {
                                     if ui.button("Open DSM (HTTP)").clicked() {
-                                        self.open(sel.as_ref().unwrap(), false);
+                                        self.open(&n, false);
                                     }
                                     if ui.button("Open DSM (HTTPS)").clicked() {
-                                        self.open(sel.as_ref().unwrap(), true);
+                                        self.open(&n, true);
+                                    }
+                                    ui.separator();
+                                    if ui.button("Open shared folders").clicked() {
+                                        self.open_shares(&n);
                                     }
                                 })
                                 .response
-                                .on_hover_text("Open DSM in your browser (double-click a device does the same)");
-                                let running = sel.as_ref().is_some_and(|d| d.info.is_memtest_running());
+                                .on_hover_text("Open DSM or the shared folders (double-click a device opens DSM)");
+                                let online = sel.as_ref().is_some_and(|r| r.online);
+                                let running = n.is_memtest_running();
                                 let b = ui
-                                    .add_enabled(!running, egui::Button::new("Memory Test"))
+                                    .add_enabled(online && !running, egui::Button::new("Memory Test"))
                                     .on_hover_text("Reboot the NAS into Synology's memory diagnostic test")
-                                    .on_disabled_hover_text("A memory test is already running");
+                                    .on_disabled_hover_text(if running {
+                                        "A memory test is already running"
+                                    } else {
+                                        "The device is offline"
+                                    });
                                 if b.clicked() {
-                                    self.open_memtest(sel.as_ref().unwrap());
+                                    self.open_memtest(&n);
                                 }
-                                if ui
-                                    .button("Set up WOL")
-                                    .on_hover_text("Remember this device for Wake on LAN")
+                                if online {
+                                    if ui
+                                        .button("Set up WOL")
+                                        .on_hover_text("Remember this device for Wake on LAN")
+                                        .clicked()
+                                    {
+                                        self.add_to_wol(&n);
+                                    }
+                                } else if ui
+                                    .button("Wake Up")
+                                    .on_hover_text("Send a Wake-on-LAN packet")
                                     .clicked()
                                 {
-                                    self.add_to_wol(sel.as_ref().unwrap());
+                                    let w = Self::wol_for(&n);
+                                    self.wake(&w);
                                 }
                             });
                         }
@@ -572,7 +778,12 @@ impl eframe::App for App {
                         devs.len()
                     };
                     let what = if self.tab == Tab::Wol { "saved device" } else { "device" };
-                    ui.label(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                    let offline = devs.iter().filter(|r| !r.online).count();
+                    if self.tab == Tab::Devices && offline > 0 {
+                        ui.label(format!("{} online · {offline} offline", n - offline));
+                    } else {
+                        ui.label(format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                    }
                     let msg = if self.status == "Searching…" && !devs.is_empty() {
                         ""
                     } else {
@@ -598,11 +809,17 @@ impl eframe::App for App {
 
         match self.tab {
             Tab::Devices => {
-                if let Some(d) = &sel {
+                if let Some(r) = &sel {
+                    let warning = r
+                        .info
+                        .ip
+                        .filter(|_| r.online)
+                        .and_then(|ip| net::reachability_warning(ip, &self.local_nets));
+                    let history = &self.history;
                     egui::Panel::bottom("details")
                         .frame(theme::chrome_frame(&ctx, egui::Margin::symmetric(12, 8)))
                         .resizable(false)
-                        .show(ui, |ui| details(ui, &d.info));
+                        .show(ui, |ui| details(ui, r, history, warning));
                 }
                 egui::CentralPanel::default().show(ui, |ui| self.device_table(ui, &devs));
             }
@@ -616,7 +833,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn device_table(&mut self, ui: &mut egui::Ui, devs: &[Device]) {
+    fn device_table(&mut self, ui: &mut egui::Ui, devs: &[Row]) {
         use egui_extras::{Column, TableBuilder};
         if devs.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -629,7 +846,7 @@ impl App {
             return;
         }
         let mut open_req = None;
-        let mut action: Option<(Device, RowAction)> = None;
+        let mut action: Option<(NasInfo, RowAction)> = None;
         let pal = theme::palette(ui);
         quiet_column_lines(ui);
         TableBuilder::new(ui)
@@ -638,7 +855,7 @@ impl App {
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .column(Column::initial(150.0).at_least(80.0).resizable(true))
             .column(Column::initial(115.0).at_least(80.0).resizable(true))
-            .column(Column::initial(230.0).at_least(110.0).resizable(true))
+            .column(Column::initial(250.0).at_least(110.0).resizable(true))
             .column(Column::initial(135.0).resizable(true))
             .column(Column::initial(80.0).resizable(true))
             .column(Column::initial(110.0).resizable(true))
@@ -661,36 +878,56 @@ impl App {
                     let n = &d.info;
                     body.row(ROW_H, |mut row| {
                         row.set_selected(self.selected.as_deref() == Some(n.mac.as_str()));
-                        let stale = d.last_seen.elapsed() > ONLINE_WINDOW;
-                        let (status, color) = if stale {
-                            ("Offline".to_string(), pal.gray)
+                        let status = self.status_text(d);
+                        let color = if d.online {
+                            status_color(pal, n.status_code)
                         } else {
-                            (n.status(), status_color(pal, n.status_code))
+                            pal.gray
                         };
-                        row.col(|ui| cell(ui, &n.name));
-                        row.col(|ui| cell(ui, &n.ip.map(|i| i.to_string()).unwrap_or_default()));
+                        // Offline rows in secondary text color (selected rows stay white).
+                        let dim = !d.online && self.selected.as_deref() != Some(n.mac.as_str());
+                        let dimmed = |ui: &mut egui::Ui| {
+                            if dim {
+                                ui.visuals_mut().override_text_color = Some(pal.text_secondary);
+                            }
+                        };
+                        let ip = n.ip.map(|i| i.to_string()).unwrap_or_default();
                         row.col(|ui| {
+                            dimmed(ui);
+                            cell(ui, &n.name);
+                        });
+                        row.col(|ui| {
+                            dimmed(ui);
+                            cell(ui, &ip);
+                        });
+                        row.col(|ui| {
+                            dimmed(ui);
                             status_dot(ui, color);
                             cell(ui, &status);
                         });
-                        row.col(|ui| cell(ui, &n.mac));
-                        row.col(|ui| cell(ui, &n.model));
-                        row.col(|ui| cell(ui, &n.dsm_version()));
-                        row.col(|ui| cell(ui, &n.serial));
+                        for c in [&n.mac, &n.model, &n.dsm_version(), &n.serial] {
+                            row.col(|ui| {
+                                dimmed(ui);
+                                cell(ui, c);
+                            });
+                        }
                         let r = row.response();
                         if r.clicked() || r.secondary_clicked() {
                             self.selected = Some(n.mac.clone());
                         }
-                        if r.double_clicked() {
-                            open_req = Some(d.clone());
+                        if r.double_clicked() && d.online {
+                            open_req = Some(n.clone());
                         }
                         r.context_menu(|ui| {
-                            let mut pick = |a| action = Some((d.clone(), a));
+                            let mut pick = |a| action = Some((n.clone(), a));
                             if ui.button("Open DSM (HTTP)").clicked() {
                                 pick(RowAction::Http);
                             }
                             if ui.button("Open DSM (HTTPS)").clicked() {
                                 pick(RowAction::Https);
+                            }
+                            if ui.button("Open shared folders").clicked() {
+                                pick(RowAction::Shares);
                             }
                             ui.separator();
                             if ui.button("Copy IP address").clicked() {
@@ -700,14 +937,23 @@ impl App {
                                 pick(RowAction::CopyMac);
                             }
                             ui.separator();
+                            if !d.online && ui.button("Wake Up").clicked() {
+                                pick(RowAction::Wake);
+                            }
                             if ui.button("Set up WOL").clicked() {
                                 pick(RowAction::Wol);
                             }
                             if ui
-                                .add_enabled(!n.is_memtest_running(), egui::Button::new("Memory Test…"))
+                                .add_enabled(d.online && !n.is_memtest_running(), egui::Button::new("Memory Test…"))
                                 .clicked()
                             {
                                 pick(RowAction::MemTest);
+                            }
+                            if !d.online {
+                                ui.separator();
+                                if ui.button("Forget this device").clicked() {
+                                    pick(RowAction::Forget);
+                                }
                             }
                         });
                     });
@@ -720,10 +966,22 @@ impl App {
             match a {
                 RowAction::Http => self.open(&d, false),
                 RowAction::Https => self.open(&d, true),
-                RowAction::CopyIp => ui.ctx().copy_text(d.info.ip.map(|i| i.to_string()).unwrap_or_default()),
-                RowAction::CopyMac => ui.ctx().copy_text(d.info.mac.clone()),
+                RowAction::Shares => self.open_shares(&d),
+                RowAction::CopyIp => ui.ctx().copy_text(d.ip.map(|i| i.to_string()).unwrap_or_default()),
+                RowAction::CopyMac => ui.ctx().copy_text(d.mac.clone()),
                 RowAction::Wol => self.add_to_wol(&d),
                 RowAction::MemTest => self.open_memtest(&d),
+                RowAction::Wake => {
+                    let w = Self::wol_for(&d);
+                    self.wake(&w);
+                }
+                RowAction::Forget => {
+                    self.known.forget(&d.mac);
+                    if self.selected.as_deref() == Some(d.mac.as_str()) {
+                        self.selected = None;
+                    }
+                    self.save_now();
+                }
             }
         }
     }
@@ -744,6 +1002,7 @@ impl App {
         let pal = theme::palette(ui);
         quiet_column_lines(ui);
         let online: Vec<bool> = self.wol.iter().map(|w| self.is_online(&w.mac)).collect();
+        let waking: Vec<Option<String>> = self.wol.iter().map(|w| self.waking_label(&w.mac)).collect();
         TableBuilder::new(ui)
             .striped(true)
             .sense(egui::Sense::click())
@@ -763,10 +1022,13 @@ impl App {
                 for (i, w) in self.wol.iter().enumerate() {
                     body.row(ROW_H, |mut row| {
                         row.set_selected(self.wol_selected == Some(i));
+                        let waking = waking[i].clone();
                         let (st, color) = if online[i] {
-                            ("On", pal.green)
+                            ("On".to_string(), pal.green)
+                        } else if let Some(l) = waking {
+                            (l, pal.orange)
                         } else {
-                            ("Off / unknown", pal.gray)
+                            ("Off / unknown".to_string(), pal.gray)
                         };
                         let target = if w.target.is_empty() {
                             "Local network".to_string()
@@ -778,7 +1040,7 @@ impl App {
                         }
                         row.col(|ui| {
                             status_dot(ui, color);
-                            cell(ui, st);
+                            cell(ui, &st);
                         });
                         let r = row.response();
                         if r.clicked() {
@@ -917,6 +1179,9 @@ fn dialog_frame(ctx: &egui::Context) -> egui::Frame {
 enum RowAction {
     Http,
     Https,
+    Shares,
+    Wake,
+    Forget,
     CopyIp,
     CopyMac,
     Wol,
@@ -996,12 +1261,20 @@ fn help_panel(ui: &mut egui::Ui, tab: Tab, selected_status: Option<u32>) {
     });
 }
 
-fn details(ui: &mut egui::Ui, n: &protocol::NasInfo) {
-    let ip = |a: Option<std::net::Ipv4Addr>| a.map(|x| x.to_string()).unwrap_or_else(|| "–".into());
-    let key_color = theme::palette(ui).text_secondary;
+fn details(ui: &mut egui::Ui, row: &Row, history: &memtest::History, warning: Option<String>) {
+    let n = &row.info;
+    let pal = theme::palette(ui);
+    let ip = |a: Option<Ipv4Addr>| a.map(|x| x.to_string()).unwrap_or_else(|| "–".into());
     let key = |ui: &mut egui::Ui, t: &str| {
-        ui.label(egui::RichText::new(t).color(key_color));
+        ui.label(egui::RichText::new(t).color(pal.text_secondary));
     };
+    if let Some(w) = warning {
+        ui.horizontal_wrapped(|ui| {
+            status_dot(ui, pal.orange);
+            ui.label(egui::RichText::new(w).color(pal.orange));
+        });
+        ui.add_space(4.0);
+    }
     ui.add_space(2.0);
     egui::Grid::new("details")
         .num_columns(4)
@@ -1028,8 +1301,12 @@ fn details(ui: &mut egui::Ui, n: &protocol::NasInfo) {
             key(ui, "Subnet mask");
             ui.label(ip(n.netmask));
             key(ui, "Status");
-            ui.label(n.status())
-                .on_hover_text(help::status_explanation(n.status_code));
+            let status = if row.online {
+                n.status()
+            } else {
+                format!("Offline (last seen {})", store::ago(row.last_seen, store::now()))
+            };
+            ui.label(status).on_hover_text(help::status_explanation(n.status_code));
             ui.end_row();
             key(ui, "Gateway");
             ui.label(ip(n.gateway));
@@ -1038,22 +1315,72 @@ fn details(ui: &mut egui::Ui, n: &protocol::NasInfo) {
             ui.end_row();
             key(ui, "DNS");
             ui.label(ip(n.dns));
-            key(ui, "Web");
-            if let Some(u) = n.web_url(false) {
-                ui.hyperlink(u);
-            }
+            key(ui, "Memory tests");
+            memtest_summary(ui, &n.mac, history);
             ui.end_row();
         });
     ui.add_space(4.0);
 }
 
+/// One line about the device's memory tests, with the full history on hover.
+fn memtest_summary(ui: &mut egui::Ui, mac: &str, history: &memtest::History) {
+    let now = store::now();
+    let runs: Vec<&memtest::Record> = history.for_device(mac).collect();
+    let text = if let Some(r) = runs.iter().rev().find(|r| r.is_running()) {
+        let (el, exact) = r.elapsed(now);
+        let mut t = format!("Running {}{}", if exact { "" } else { "≥ " }, store::duration(el));
+        if let Some(left) = r.remaining() {
+            t.push_str(&format!(" · ~{} left", store::duration(left)));
+        }
+        t
+    } else if runs.is_empty() {
+        "None recorded on this computer".into()
+    } else {
+        let ok = runs
+            .iter()
+            .filter(|r| r.outcome == Some(memtest::Outcome::NoErrors))
+            .count();
+        let bad = runs
+            .iter()
+            .filter(|r| r.outcome == Some(memtest::Outcome::Errors))
+            .count();
+        let last = runs.iter().filter_map(|r| r.finished).max().unwrap_or(now);
+        format!(
+            "{} run{}: {ok} passed, {bad} with errors · last {}",
+            runs.len(),
+            if runs.len() == 1 { "" } else { "s" },
+            store::ago(last, now)
+        )
+    };
+    let resp = ui.add(egui::Label::new(text).truncate());
+    if !runs.is_empty() {
+        resp.on_hover_ui(|ui| {
+            for r in runs.iter().rev().take(10) {
+                let (el, exact) = r.elapsed(now);
+                let result = match (r.is_running(), r.outcome) {
+                    (true, _) => "running",
+                    (_, Some(memtest::Outcome::NoErrors)) => "no errors",
+                    (_, Some(memtest::Outcome::Errors)) => "errors found",
+                    _ => "interrupted",
+                };
+                let when = r.started.unwrap_or(r.first_seen.0);
+                ui.label(format!(
+                    "{} · {}{} · {result}",
+                    store::ago(when, now),
+                    if exact { "" } else { "≥ " },
+                    store::duration(el)
+                ));
+            }
+        });
+    }
+}
+
 /// Renders the UI to PNGs in target/ui-shots for visual review:
-/// `cargo test --release ui_snapshots -- --ignored`
+/// `cargo test --release --bin synology-assistant ui_snapshots -- --ignored`
 #[cfg(test)]
 mod ui_snapshots {
     use super::*;
     use egui_kittest::Harness;
-    use protocol::NasInfo;
 
     fn dev(name: &str, ip: u8, code: u32, progress: Option<u32>, model: &str) -> Device {
         Device {
@@ -1061,17 +1388,17 @@ mod ui_snapshots {
                 packet_type: protocol::PKT_INFO,
                 name: name.into(),
                 mac: format!("00:11:32:00:00:{ip:02x}"),
-                ip: Some(std::net::Ipv4Addr::new(192, 168, 1, ip)),
-                netmask: Some(std::net::Ipv4Addr::new(255, 255, 255, 0)),
-                gateway: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
-                dns: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+                ip: Some(Ipv4Addr::new(192, 168, 1, ip)),
+                netmask: Some(Ipv4Addr::new(255, 255, 255, 0)),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                dns: Some(Ipv4Addr::new(192, 168, 1, 1)),
                 dhcp: Some(true),
                 model: model.into(),
                 unique: "synology_geminilake_220+".into(),
                 os_name: "DSM".into(),
                 version: "7.4.1".into(),
                 build: Some(90080),
-                serial: "0000ABCDEFGHI".into(),
+                serial: format!("2080ABCDEF{ip:03}"),
                 status_code: Some(code),
                 progress,
                 public_key: "00".repeat(32),
@@ -1082,27 +1409,82 @@ mod ui_snapshots {
         }
     }
 
+    fn sample_app(cc: &eframe::CreationContext<'_>) -> App {
+        let mut app = App::build(cc, Err("test".into()));
+        app.fake_devices = Some(vec![
+            dev("DS220plus", 15, 9, Some(7536), "DS220+"),
+            dev("backup-nas", 20, 1, None, "DS923+"),
+            dev("new-box", 30, 2, None, "DS224+"),
+        ]);
+        app.status.clear();
+        app.local_nets = vec![(Ipv4Addr::new(192, 168, 1, 236), Ipv4Addr::new(255, 255, 255, 0))];
+        let now = store::now();
+        // A memory test observed for 3.5 hours, so an estimate is available.
+        app.history.records.push(memtest::Record {
+            mac: "00:11:32:00:00:0f".into(),
+            name: "DS220plus".into(),
+            started: None,
+            first_seen: (now - 12_600, 3855),
+            last_seen: (now, 7536),
+            finished: None,
+            outcome: None,
+        });
+        // Two earlier passes on another device.
+        for ago in [86_400 * 3, 86_400 * 2] {
+            app.history.records.push(memtest::Record {
+                mac: "00:11:32:00:00:14".into(),
+                name: "backup-nas".into(),
+                started: Some(now - ago),
+                first_seen: (now - ago, 0),
+                last_seen: (now - ago + 30_000, 9_990),
+                finished: Some(now - ago + 30_600),
+                outcome: Some(memtest::Outcome::NoErrors),
+            });
+        }
+        // An offline device remembered from yesterday.
+        let off = dev("office-nas", 40, 1, None, "DS1522+").info;
+        app.known.seen(&off, now - 26 * 3600);
+        app
+    }
+
     fn shot(theme: egui::Theme, name: &str, setup: impl FnOnce(&mut App)) {
         let mut h = Harness::builder()
             .with_size(egui::vec2(1000.0, 560.0))
             .with_pixels_per_point(2.0)
             .with_theme(theme)
-            .build_eframe(|cc| {
-                let mut app = App::build(cc, Err("test".into()));
-                app.fake_devices = Some(vec![
-                    dev("DS220plus", 15, 9, Some(7536), "DS220+"),
-                    dev("backup-nas", 20, 1, None, "DS923+"),
-                    dev("new-box", 30, 2, None, "DS224+"),
-                ]);
-                app.status.clear();
-                app
-            });
+            .build_eframe(|cc| sample_app(cc));
         setup(h.state_mut());
         h.run();
         let img = h.render().expect("render");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-shots");
         std::fs::create_dir_all(&dir).unwrap();
         img.save(dir.join(format!("{name}.png"))).unwrap();
+    }
+
+    /// End-to-end: real discovery on the LAN, rendered to target/ui-shots/live.png.
+    #[test]
+    #[ignore = "needs a Synology device on the network"]
+    fn live_snapshot() {
+        let mut h = Harness::builder()
+            .with_size(egui::vec2(1000.0, 560.0))
+            .with_pixels_per_point(2.0)
+            .build_eframe(|cc| {
+                let disco = Discovery::start(|| {}).map_err(|e| e.to_string());
+                let mut app = App::build(cc, disco);
+                app.local_nets = net::local_networks();
+                app
+            });
+        for _ in 0..6 {
+            h.run();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        let first = h.state().live_devices().first().map(|d| d.info.mac.clone());
+        assert!(first.is_some(), "no device answered");
+        h.state_mut().selected = first;
+        h.run();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/ui-shots");
+        std::fs::create_dir_all(&dir).unwrap();
+        h.render().unwrap().save(dir.join("live.png")).unwrap();
     }
 
     #[test]
@@ -1112,23 +1494,32 @@ mod ui_snapshots {
             shot(t, &format!("{tn}-devices"), |a| {
                 a.selected = Some("00:11:32:00:00:0f".into())
             });
+            shot(t, &format!("{tn}-details"), |a| {
+                a.selected = Some("00:11:32:00:00:14".into())
+            });
+            shot(t, &format!("{tn}-offline"), |a| {
+                a.selected = Some("00:11:32:00:00:28".into())
+            });
+            shot(t, &format!("{tn}-subnet"), |a| {
+                a.fake_devices.as_mut().unwrap()[2].info.ip = Some(Ipv4Addr::new(192, 168, 2, 30));
+                a.selected = Some("00:11:32:00:00:1e".into());
+            });
             shot(t, &format!("{tn}-help"), |a| {
                 a.selected = Some("00:11:32:00:00:0f".into());
                 a.show_help = true;
             });
             shot(t, &format!("{tn}-wol"), |a| {
                 a.tab = Tab::Wol;
-                a.wol = vec![WolDevice {
-                    name: "DS220plus".into(),
-                    mac: "00:11:32:00:00:0f".into(),
-                    ip: "192.168.1.15".into(),
-                    target: String::new(),
-                    port: 9,
-                }];
+                let ds = a.fake_devices.as_ref().unwrap()[0].info.clone();
+                let off = a.known.devices["00:11:32:00:00:28"].info.clone();
+                a.wol = vec![App::wol_for(&ds), App::wol_for(&off)];
+                a.waking.insert(
+                    "00:11:32:00:00:28".into(),
+                    (Instant::now() - Duration::from_secs(42), "office-nas".into()),
+                );
             });
             shot(t, &format!("{tn}-addwol"), |a| {
                 a.tab = Tab::Wol;
-                a.wol.clear();
                 a.new_wol = Some(WolDevice {
                     name: String::new(),
                     mac: "00:11".into(),
@@ -1139,7 +1530,7 @@ mod ui_snapshots {
             });
             shot(t, &format!("{tn}-memtest"), |a| {
                 a.selected = Some("00:11:32:00:00:14".into());
-                let d = a.fake_devices.as_ref().unwrap()[1].clone();
+                let d = a.fake_devices.as_ref().unwrap()[1].info.clone();
                 a.open_memtest(&d);
             });
         }

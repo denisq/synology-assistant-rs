@@ -3,7 +3,6 @@
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WolDevice {
@@ -91,26 +90,14 @@ pub fn wake(dev: &WolDevice) -> io::Result<usize> {
     }
 }
 
-fn store_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("SynologyAssistantRS")
-        .join("wol.json")
-}
+const FILE: &str = "wol.json";
 
 pub fn load() -> Vec<WolDevice> {
-    std::fs::read(store_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    crate::store::load(FILE)
 }
 
 pub fn save(list: &[WolDevice]) -> io::Result<()> {
-    let p = store_path();
-    if let Some(d) = p.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(p, serde_json::to_vec_pretty(list)?)
+    crate::store::save(FILE, list)
 }
 
 #[cfg(test)]

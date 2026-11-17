@@ -7,7 +7,7 @@ A small, fast, native replacement for Synology Assistant: find your Synology NAS
 wake it with Wake-on-LAN, and start a memory test. Runs on Apple Silicon without Rosetta, and on Windows and Linux.
 </p>
 
-<p align="center"><img src="assets/screenshot.png" width="820" alt="Device list with help panel"></p>
+<p align="center"><img src="assets/screenshot.png" width="820" alt="Device list: a memory test with time estimate, an offline device, details panel"></p>
 
 > [!WARNING]
 > **Unofficial and vibe coded.** This project is not affiliated with, endorsed by, or supported by Synology Inc.
@@ -28,14 +28,25 @@ alternative that should keep working after that.
 |---|---|
 | 🔍 **Discovery** | Finds Synology devices on your LAN (auto refresh every 10 s): name, IP, status, MAC, model, DSM version, serial, plus network details |
 | 🌐 **Connect** | Double-click a device to open DSM (HTTP or HTTPS) in your browser |
-| ⏻ **Wake on LAN** | Remember devices and wake them later, locally or through a router (directed broadcast / host name) |
-| 🧪 **Memory test** | Starts Synology's built-in memory diagnostic, with progress shown in the list and the result reported when it finishes |
+| ⏻ **Wake on LAN** | Remember devices and wake them, locally or through a router; shows "Waking…" until the NAS answers |
+| 🧪 **Memory test** | Starts Synology's built-in memory diagnostic, with progress **and an estimate of the time left** in the list, a desktop notification with the result, and a per-device history of runs |
+| 🔔 **Notifications** | Memory test finished (with or without errors), and a woken NAS answering again |
+| 💤 **Offline devices** | Devices seen before stay listed in grey with "last seen", and can be woken up from the list |
+| 📁 **Shared folders** | Opens the NAS's SMB shares in Finder or Explorer |
+| ⚠️ **Network hints** | Warns when a NAS is on a different subnet or has no DHCP address, which explains why DSM won't open |
 | ❓ **Built-in help** | Help side panel (F1) explaining every device status, Wake on LAN, the memory test and troubleshooting |
 | 🔐 **Encrypted login** | Admin credentials are sealed to the NAS's public key (libsodium-compatible `crypto_box_seal`), like the original app |
 | ⌨️ **CLI** | `synology-assistant --scan` and `synology-assistant --wake <MAC>` |
 
 **Not included** (yet): the original app's DSM install/network-setup wizards, drive mapping, printer management, and recovery.
 To set up a new or reset NAS, open `http://<nas-ip>:5000` or <https://finds.synology.com>.
+
+<p align="center"><img src="assets/screenshot-dark.png" width="640" alt="Dark mode with the help panel"></p>
+
+### Beyond the original app
+The original Synology Assistant shows a memory-test percentage, but nothing about how long is left, nothing when it ends
+unless you watch the window, and no record of past runs, which Synology support often asks for (usually 3 passes).
+This app adds all three, keeps offline devices visible, and explains common network mistakes.
 
 ## Install
 
@@ -84,7 +95,8 @@ Tested against a DS220+ on DSM 7.4.1. Reports from other models and DSM versions
 
 The app talks only to your local network (and opens your browser when you click Connect). It has no telemetry and makes
 no internet connections. The Wake-on-LAN list is stored locally (e.g. `~/Library/Application Support/SynologyAssistantRS/wol.json`
-on macOS). Passwords are never stored.
+on macOS), together with the memory-test history (`memtests.json`) and devices seen before (`devices.json`).
+Passwords are never stored.
 
 ## Contributing
 

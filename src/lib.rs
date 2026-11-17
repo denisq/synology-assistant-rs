@@ -1,6 +1,10 @@
 pub mod discovery;
 pub mod help;
+pub mod known;
 pub mod matrix;
+pub mod memtest;
+pub mod net;
 pub mod protocol;
 pub mod secure;
+pub mod store;
 pub mod wol;

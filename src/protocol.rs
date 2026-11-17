@@ -29,6 +29,9 @@ pub mod field {
     pub const MODEL: u8 = 0x78;
     pub const PROGRESS: u8 = 0x79;
     pub const MAGIC_A4: u8 = 0xa4;
+    /// 64-bit "services supported" / "services running" bitmaps.
+    pub const SERV_SUPPORTED: u8 = 0xb0;
+    pub const SERV_RUNNING: u8 = 0xb8;
     pub const PROTO_VERSION: u8 = 0xa6;
     pub const SYS_STATUS: u8 = 0xa7;
     pub const SERIAL: u8 = 0xc0;
@@ -103,7 +106,10 @@ fn push_u32(p: &mut Vec<u8>, id: u8, v: u32) {
     p.extend_from_slice(&v.to_le_bytes());
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What a NAS reports about itself. Serialized to remember known devices;
+/// session-specific fields are not stored.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct NasInfo {
     pub packet_type: u32,
     pub name: String,
@@ -124,14 +130,23 @@ pub struct NasInfo {
     pub http_port: Option<u16>,
     pub https_port: Option<u16>,
     /// NAS public key (hex) when it supports encrypted commands.
+    #[serde(skip)]
     pub public_key: String,
+    #[serde(skip)]
     pub session_id: Option<u32>,
+    pub serv_supported: Option<u64>,
+    pub serv_running: Option<u64>,
     /// Result code of an acknowledgement (packet type 2), field 0x1f.
+    #[serde(skip)]
     pub result_code: Option<u32>,
 }
 
 fn u32_le(v: &[u8]) -> Option<u32> {
     (v.len() >= 4).then(|| u32::from_le_bytes([v[0], v[1], v[2], v[3]]))
+}
+
+fn u64_le(v: &[u8]) -> Option<u64> {
+    v.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 fn ipv4(v: &[u8]) -> Option<Ipv4Addr> {
@@ -172,6 +187,8 @@ pub fn parse(buf: &[u8]) -> Option<NasInfo> {
             field::PROGRESS => n.progress = u32_le(v),
             field::HTTP_PORT => n.http_port = u32_le(v).and_then(|x| u16::try_from(x).ok()).filter(|&p| p != 0),
             field::HTTPS_PORT => n.https_port = u32_le(v).and_then(|x| u16::try_from(x).ok()).filter(|&p| p != 0),
+            field::SERV_SUPPORTED => n.serv_supported = u64_le(v),
+            field::SERV_RUNNING => n.serv_running = u64_le(v),
             field::PUBLIC_KEY => n.public_key = text(v),
             field::RESULT => n.result_code = u32_le(v),
             field::SESSION_ID => n.session_id = u32_le(v).filter(|&x| x != 0),
@@ -213,6 +230,10 @@ impl NasInfo {
             3 => "Upgrading".into(),
             4 => "Configuration lost".into(),
             5 => "Booting".into(),
+            6 if self.is_fsck_running() => match self.progress {
+                Some(m) => format!("Checking file system ({m} min remaining)"),
+                None => "Checking file system".into(),
+            },
             6 => "Checking quota".into(),
             7 => "Starting services".into(),
             9 => format!("Performing memory test ({})", pct.unwrap_or_default()),
@@ -221,6 +242,15 @@ impl NasInfo {
             14 => "Migratable".into(),
             other => format!("Status {other}"),
         }
+    }
+
+    /// File-system check in progress: status 6 with service bit 8 supported and
+    /// running (`CAsstNasinfoModel::getServerStatus`); field 0x79 holds the minutes left.
+    pub fn is_fsck_running(&self) -> bool {
+        const FSCK: u64 = 0x100;
+        self.status_code == Some(6)
+            && self.serv_supported.unwrap_or(0) & FSCK != 0
+            && self.serv_running.unwrap_or(0) & FSCK != 0
     }
 
     pub fn is_memtest_running(&self) -> bool {
@@ -287,6 +317,19 @@ mod tests {
         assert_eq!(n.status(), "Performing memory test (38.55%)");
         assert!(n.is_memtest_running());
         assert_eq!(n.web_url(false).unwrap(), "http://192.168.1.15:5000");
+    }
+
+    #[test]
+    fn fsck_status() {
+        let mut n = NasInfo {
+            status_code: Some(6),
+            ..Default::default()
+        };
+        assert_eq!(n.status(), "Checking quota");
+        n.serv_supported = Some(0x100);
+        n.serv_running = Some(0x100);
+        n.progress = Some(12);
+        assert_eq!(n.status(), "Checking file system (12 min remaining)");
     }
 
     #[test]

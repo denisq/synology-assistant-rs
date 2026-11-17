@@ -14,7 +14,9 @@ pub fn status_explanation(code: Option<u32>) -> &'static str {
             "The settings were reset (typically a 4-second reset-button press, \"mode 2\"). Reinstall DSM from the web page; data on the volumes is kept."
         }
         Some(5) => "The system is booting.",
-        Some(6) => "Drive quotas are being checked, often after an improper shutdown.",
+        Some(6) => {
+            "Drive quotas or the file system are being checked, often after an improper shutdown. Wait for it to finish."
+        }
         Some(7) => "DSM services are starting; this can take up to about 10 minutes.",
         Some(9) => {
             "A memory test is running; the NAS is not usable until it finishes. Results are written to the DSM system log."
@@ -54,7 +56,9 @@ pub const GETTING_STARTED: Section = Section {
     title: "Getting started",
     body: &[
         "The app searches your local network for Synology devices every 10 seconds; click Search to start over.",
-        "Select a device to see its network details below the list. Double-click it, or click Connect, to open DSM in your browser.",
+        "Select a device to see its network details below the list. Double-click it, or click Connect, to open DSM in your browser. Connect › Open shared folders opens its SMB shares in Finder or Explorer.",
+        "Devices you have seen before stay listed in grey while offline, with when they were last seen. Right-click one to wake it up or to forget it.",
+        "If a device is on a different subnet than your computer, an orange note under the list explains why DSM may not open.",
         "Discovery only works on the same network segment as the NAS: it uses UDP broadcasts on port 9999, which routers and most VPNs don't forward.",
     ],
 };
@@ -64,7 +68,8 @@ pub const WOL: Section = Section {
     body: &[
         "1. In DSM, enable Wake on LAN under Control Panel › Hardware & Power › General (on models that support it).",
         "2. While the NAS is on, select it under Management and click Set up WOL. It is remembered on this computer.",
-        "3. To wake it later, open the Wake on LAN tab, select it, and click Wake Up (or double-click it).",
+        "3. To wake it later, open the Wake on LAN tab, select it, and click Wake Up (or double-click it). You can also right-click an offline device in the Management list and choose Wake Up.",
+        "After a wake-up the status shows \"Waking…\" with a timer; you get a notification as soon as the NAS answers (usually 1–3 minutes).",
         "Use Add device… for a NAS that is currently off and whose MAC address you know. Fill in Target only to wake through a router (a directed broadcast such as 192.168.1.255, or a host name with port forwarding).",
         "Status shows On while the NAS answers searches, and Off / unknown otherwise.",
     ],
@@ -75,7 +80,9 @@ pub const MEMTEST: Section = Section {
     body: &[
         "Select a device under Management and click Memory Test. You need a DSM administrator account.",
         "The NAS reboots into a diagnostic mode and is unavailable until the test ends. Depending on the amount of RAM this takes from minutes to many hours; progress shows in the Status column.",
-        "When the device leaves test mode while this app is open, the status bar says whether errors were found. Details are written to the DSM system log.",
+        "Once some progress has been measured, the Status column shows an estimate of the time left.",
+        "When the test ends while this app is open, you get a desktop notification saying whether errors were found. Details are written to the DSM system log.",
+        "Each run is recorded on this computer: the details panel shows how many runs passed or found errors (hover it for the list).",
         "If Synology support asks you to test memory, run it several times (they usually ask for at least 3) and attach the debug log to your ticket.",
         "On dual-controller models, test one controller at a time so the system keeps serving.",
         "Your password is encrypted with the NAS's public key before it is sent. Older systems that don't offer a key would receive it unencrypted; the app warns you first.",
