@@ -204,7 +204,8 @@ mod tests {
             if path.ends_with("i18n.rs") {
                 continue; // only documentation examples here
             }
-            let src = std::fs::read_to_string(path).unwrap();
+            // Windows checkouts use CRLF; Rust strips it in string continuations, so do the same.
+            let src = std::fs::read_to_string(path).unwrap().replace("\r\n", "\n");
             let mut rest = src.as_str();
             while let Some(i) = rest.find("t!(") {
                 // skip things like `format!(` or `assert!(`
