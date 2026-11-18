@@ -1,6 +1,6 @@
 [package]
 name = "synology-assistant-rs"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Fast, native replacement for Synology Assistant: find Synology NAS devices on your LAN, Wake-on-LAN, memory test"
 license = "MIT"
