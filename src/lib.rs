@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod help;
+pub mod i18n;
 pub mod known;
 pub mod matrix;
 pub mod memtest;

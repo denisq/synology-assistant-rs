@@ -4,7 +4,8 @@
 
 <p align="center">
 A small, fast, native replacement for Synology Assistant: find your Synology NAS on the local network,
-wake it with Wake-on-LAN, and start a memory test. Runs on Apple Silicon without Rosetta, and on Windows and Linux.
+wake it with Wake-on-LAN, run a memory test and change its network settings. Runs on Apple Silicon without Rosetta,
+and on Windows and Linux.
 </p>
 
 <p align="center"><img src="assets/screenshot.png" width="820" alt="Device list: a memory test with time estimate, an offline device, details panel"></p>
@@ -33,20 +34,32 @@ alternative that should keep working after that.
 | 🔔 **Notifications** | Memory test finished (with or without errors), and a woken NAS answering again |
 | 💤 **Offline devices** | Devices seen before stay listed in grey with "last seen", and can be woken up from the list |
 | 📁 **Shared folders** | Opens the NAS's SMB shares in Finder or Explorer |
-| ⚠️ **Network hints** | Warns when a NAS is on a different subnet or has no DHCP address, which explains why DSM won't open |
-| ❓ **Built-in help** | Help side panel (F1) explaining every device status, Wake on LAN, the memory test and troubleshooting |
+| 🛠 **Network settings** | Switch a NAS between DHCP and a fixed IP, or change its gateway and DNS (admin login, encrypted) |
+| 🩺 **"Why don't I see my NAS?"** | Detects an active VPN, no local network, a blocked local-network permission, a NAS on another subnet; **Find by IP** tells "switched off" apart from "on, but its firewall blocks discovery" |
+| ❓ **Built-in help** | Help side panel (F1) explaining every device status, Wake on LAN, the memory test, network settings and troubleshooting |
+| 🌍 **Languages** | English and Spanish (follows the system, or choose in Help); adding a language is one JSON file |
 | 🔐 **Encrypted login** | Admin credentials are sealed to the NAS's public key (libsodium-compatible `crypto_box_seal`), like the original app |
 | ⌨️ **CLI** | `synology-assistant --scan` and `synology-assistant --wake <MAC>` |
 
-**Not included** (yet): the original app's DSM install/network-setup wizards, drive mapping, printer management, and recovery.
-To set up a new or reset NAS, open `http://<nas-ip>:5000` or <https://finds.synology.com>.
-
 <p align="center"><img src="assets/screenshot-dark.png" width="640" alt="Dark mode with the help panel"></p>
 
-### Beyond the original app
-The original Synology Assistant shows a memory-test percentage, but nothing about how long is left, nothing when it ends
-unless you watch the window, and no record of past runs, which Synology support often asks for (usually 3 passes).
-This app adds all three, keeps offline devices visible, and explains common network mistakes.
+## Compared with the original Synology Assistant
+
+| Feature | Original | This app |
+|---|---|---|
+| Find devices on the LAN, status, details | ✅ | ✅ |
+| Open DSM in the browser | ✅ | ✅ |
+| Wake on LAN (save devices, wake, on/off status) | ✅ | ✅ plus "Waking…" until the NAS answers, and a notification |
+| Memory test | ✅ (enable it in Preferences) | ✅ plus time left, result notification, history of runs |
+| Network settings (DHCP / fixed IP, gateway, DNS) | ✅ | ✅ |
+| "Checking file system (N min remaining)" status | ✅ | ✅ |
+| Hints when no device is found | Generic tips | Detects VPN, no network, permissions, other subnet; Find by IP |
+| Offline devices stay listed, open shared folders | ❌ | ✅ |
+| Runs natively on Apple Silicon, Windows, Linux | ❌ (Intel macOS needs Rosetta) | ✅ |
+| Languages | ~20 | English, Spanish (one JSON file per language) |
+| DSM install wizard | ✅ | ❌ not planned: every NAS now has its own web installer at `http://<nas-ip>:5000` (or use <https://finds.synology.com>) |
+| Drive mapping, printers | ✅ (Windows-oriented) | ❌ not planned; "Open shared folders" covers the common case |
+| Recovery, file-system-check cancel | ✅ | ❌ rarely needed; DSM's web page handles recovery |
 
 ## Install
 
@@ -85,24 +98,37 @@ sealed to that key and advertises its own, and commands are sent as `12 34 55 66
 | [`src/protocol.rs`](src/protocol.rs) | Packet format, field IDs, status codes |
 | [`src/secure.rs`](src/secure.rs) | Key exchange and sealed packets |
 | [`src/matrix.rs`](src/matrix.rs) | The password obfuscation the original app applies before sending |
-| [`src/discovery.rs`](src/discovery.rs) | Broadcast search, reply handling, memory-test command |
+| [`src/discovery.rs`](src/discovery.rs) | Broadcast search, reply handling, memory-test and network-settings commands |
+| [`src/net.rs`](src/net.rs) | VPN / no-network detection, subnet checks, DSM port probe |
+| [`src/i18n.rs`](src/i18n.rs), [`locales/`](locales) | Translations |
 | [`src/wol.rs`](src/wol.rs) | Wake-on-LAN magic packets and saved devices |
 | [`src/main.rs`](src/main.rs), [`src/help.rs`](src/help.rs) | The [egui](https://github.com/emilk/egui) user interface and help text |
 
 Tested against a DS220+ on DSM 7.4.1. Reports from other models and DSM versions are very welcome. Please open an issue.
 
+## Add a language
+
+1. Copy [`locales/es.json`](locales/es.json) to `locales/<code>.json` (e.g. `fr.json`) and translate the values.
+   Keep `{placeholders}` as they are. The keys are the English texts.
+2. Add the language to `LANGUAGES` in [`src/i18n.rs`](src/i18n.rs).
+3. Run `cargo test`: it fails if a text is missing or a placeholder differs.
+   `cargo test --lib dump_template -- --ignored` writes `locales/template.json` with every text to translate.
+
+The app follows the system language; you can switch in Help › Language, or start it with `SYNOLOGY_ASSISTANT_LANG=es`.
+
 ## Privacy
 
-The app talks only to your local network (and opens your browser when you click Connect). It has no telemetry and makes
+The app talks only to your local network (and opens your browser or file manager when you ask it to). It has no telemetry and makes
 no internet connections. The Wake-on-LAN list is stored locally (e.g. `~/Library/Application Support/SynologyAssistantRS/wol.json`
-on macOS), together with the memory-test history (`memtests.json`) and devices seen before (`devices.json`).
+on macOS), together with the memory-test history (`memtests.json`), devices seen before (`devices.json`) and your
+language choice (`settings.json`).
 Passwords are never stored.
 
 ## Contributing
 
 Issues and pull requests are welcome, especially:
 - test results on other Synology models and DSM versions,
-- the setup and install wizards of the original app,
+- translations (see above),
 - Windows and Linux polish (packaging, icons, installers).
 
 ## Legal

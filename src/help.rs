@@ -89,6 +89,15 @@ pub const MEMTEST: Section = Section {
     ],
 };
 
+pub const NETWORK: Section = Section {
+    title: "Network settings",
+    body: &[
+        "Select a device under Management and click Network Settings to switch it between an automatic (DHCP) and a fixed address, or to change its gateway and DNS. You need a DSM administrator account.",
+        "The NAS applies the change right away and may reappear at a new address. Pick an address in your computer's subnet, or you won't reach it from here afterwards.",
+        "Not listed? Use Find by IP… to ask a NAS directly: the app tells you whether it answers, and whether its firewall blocks discovery.",
+    ],
+};
+
 pub const TROUBLESHOOTING: Section = Section {
     title: "Troubleshooting",
     body: &[
@@ -107,4 +116,26 @@ pub const ABOUT: Section = Section {
     ],
 };
 
-pub const SECTIONS: &[&Section] = &[&GETTING_STARTED, &WOL, &MEMTEST, &TROUBLESHOOTING, &ABOUT];
+pub const SECTIONS: &[&Section] = &[&GETTING_STARTED, &WOL, &MEMTEST, &NETWORK, &TROUBLESHOOTING, &ABOUT];
+
+/// Every text of the help content, for translation coverage checks.
+pub fn all_texts() -> Vec<&'static str> {
+    let mut v = Vec::new();
+    for s in SECTIONS {
+        v.push(s.title);
+        v.extend_from_slice(s.body);
+    }
+    for (name, code) in STATUSES {
+        v.push(name);
+        v.push(status_explanation(Some(*code)));
+    }
+    v.push(status_explanation(None));
+    v.extend([
+        "Help",
+        "Selected device",
+        "Device status",
+        "Project page & feedback",
+        "Language",
+    ]);
+    v
+}

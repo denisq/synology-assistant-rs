@@ -6,6 +6,7 @@
 //! addresses are stored in network byte order, strings are plain ASCII/UTF-8
 //! without terminator.
 
+use crate::t;
 use std::net::Ipv4Addr;
 
 pub const PORT: u16 = 9999;
@@ -37,6 +38,13 @@ pub mod field {
     pub const SERIAL: u8 = 0xc0;
     pub const OS_NAME: u8 = 0xc1;
     pub const RESULT: u8 = 0x1f;
+    pub const NEW_DHCP: u8 = 0x20;
+    pub const NEW_SERVER_NAME: u8 = 0x21;
+    pub const NEW_IP: u8 = 0x22;
+    pub const NEW_NETMASK: u8 = 0x23;
+    pub const NEW_GATEWAY: u8 = 0x24;
+    pub const NEW_DNS: u8 = 0x25;
+    pub const TARGET_MAC: u8 = 0x29;
     pub const PASSWORD: u8 = 0x2a;
     pub const ACCOUNT: u8 = 0x4a;
     pub const CLIENT_BUILD: u8 = 0xc2;
@@ -91,6 +99,86 @@ pub fn build_memtest(mac: &str, account: &str, password: &str, session_id: Optio
         push_u32(&mut p, field::SESSION_ID, id);
     }
     p
+}
+
+/// "Apply network settings" command (`CFindHostUDP::sendPktNetSetting`): type 3 for a
+/// configured NAS, type 4 for one that is not configured yet.
+pub const PKT_NETSET: u32 = 3;
+pub const PKT_NETSET_UNCONFIGURED: u32 = 4;
+
+/// New network configuration for a NAS. With `dhcp`, the addresses are not sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetConfig {
+    pub dhcp: bool,
+    pub ip: Ipv4Addr,
+    pub netmask: Ipv4Addr,
+    pub gateway: Ipv4Addr,
+    pub dns: Ipv4Addr,
+}
+
+/// Plain "apply network settings" packet, field for field as the original app builds it.
+/// The server name is sent unchanged (the original does the same).
+pub fn build_netsetting(
+    dev: &NasInfo,
+    cfg: &NetConfig,
+    account: &str,
+    password: &str,
+    session_id: Option<u32>,
+) -> Vec<u8> {
+    let configured = dev.status_code.unwrap_or(1) != 0;
+    let mut p = MAGIC.to_vec();
+    if configured && !dev.name.is_empty() {
+        push_str(&mut p, field::NEW_SERVER_NAME, &dev.name);
+    }
+    let kind = if configured {
+        PKT_NETSET
+    } else {
+        PKT_NETSET_UNCONFIGURED
+    };
+    push_u32(&mut p, field::PACKET_TYPE, kind);
+    push_u32(&mut p, field::MAGIC_A4, 0x0102_0000);
+    push_str(&mut p, field::TARGET_MAC, &dev.mac);
+    push_u32(&mut p, field::NEW_DHCP, cfg.dhcp as u32);
+    if let Some(id) = session_id {
+        push_u32(&mut p, field::SESSION_ID, id);
+    }
+    if !cfg.dhcp {
+        for (id, addr) in [
+            (field::NEW_IP, cfg.ip),
+            (field::NEW_NETMASK, cfg.netmask),
+            (field::NEW_GATEWAY, cfg.gateway),
+            (field::NEW_DNS, cfg.dns),
+        ] {
+            p.push(id);
+            p.push(4);
+            p.extend_from_slice(&addr.octets()); // network byte order, like the replies
+        }
+    }
+    let enc = crate::matrix::encode(password);
+    if !enc.is_empty() {
+        push_str(&mut p, field::PASSWORD, &enc);
+    }
+    push_str(&mut p, field::ACCOUNT, account);
+    push_u32(&mut p, field::CLIENT_BUILD, CLIENT_BUILD);
+    p
+}
+
+/// Meaning of the result code in the network-settings acknowledgement
+/// (`CAsstWindowMain::slotNetSettingFinished`).
+pub fn netsetting_result_message(code: u32) -> Result<(), &'static str> {
+    match code {
+        0 => Ok(()),
+        1 => Err(t!("The account or password is invalid. Please try again.")),
+        2 => Err(t!("The NAS could not apply these settings. Try another IP address.")),
+        3 => Err(t!("The NAS is busy. Wait a moment and try again.")),
+        4 => Err(t!(
+            "The NAS found no DHCP server on the network. Use manual settings instead."
+        )),
+        6 => Err(t!("You are not authorized to use this service (login blocked).")),
+        8 => Err(t!("The user account has been disabled.")),
+        9 => Err(t!("Please enter an administrator account.")),
+        _ => Err(t!("The NAS reported an error while applying the settings.")),
+    }
 }
 
 fn push_str(p: &mut Vec<u8>, id: u8, v: &str) {
@@ -200,8 +288,14 @@ pub fn parse(buf: &[u8]) -> Option<NasInfo> {
 
 impl NasInfo {
     /// True for packets worth showing in the device list (a NAS describing itself).
+    ///
+    /// A NAS in normal operation answers with packet type 2 (the same type as
+    /// command acknowledgements); during a memory test or setup it uses type 6.
+    /// Acknowledgements carry a result code instead of a model and name.
     pub fn is_device_info(&self) -> bool {
-        self.packet_type == PKT_INFO && !self.mac.is_empty() && self.ip.is_some()
+        let describes_device = !self.model.is_empty() || !self.name.is_empty();
+        let info_type = self.packet_type == PKT_INFO || (self.packet_type == PKT_ACK && self.result_code.is_none());
+        info_type && describes_device && !self.mac.is_empty() && self.ip.is_some()
     }
 
     /// "7.4.1-90080" style version string.
@@ -209,7 +303,7 @@ impl NasInfo {
         match (self.version.is_empty(), self.build) {
             (false, Some(b)) => format!("{}-{}", self.version, b),
             (false, None) => self.version.clone(),
-            (true, Some(b)) => format!("build {b}"),
+            (true, Some(b)) => t!("build {b}", b = b),
             (true, None) => String::new(),
         }
     }
@@ -220,27 +314,27 @@ impl NasInfo {
     /// memory test runs the NAS reports code 9 with progress in hundredths of a percent.
     pub fn status(&self) -> String {
         let Some(code) = self.status_code else {
-            return "Unknown".into();
+            return t!("Unknown").into();
         };
         let pct = self.progress.map(|p| format!("{}.{:02}%", p / 100, p % 100));
         match code {
-            0 => "Not configured".into(),
-            1 => "Ready".into(),
-            2 => "Not installed".into(),
-            3 => "Upgrading".into(),
-            4 => "Configuration lost".into(),
-            5 => "Booting".into(),
+            0 => t!("Not configured").into(),
+            1 => t!("Ready").into(),
+            2 => t!("Not installed").into(),
+            3 => t!("Upgrading").into(),
+            4 => t!("Configuration lost").into(),
+            5 => t!("Booting").into(),
             6 if self.is_fsck_running() => match self.progress {
-                Some(m) => format!("Checking file system ({m} min remaining)"),
-                None => "Checking file system".into(),
+                Some(m) => t!("Checking file system ({m} min remaining)", m = m),
+                None => t!("Checking file system").into(),
             },
-            6 => "Checking quota".into(),
-            7 => "Starting services".into(),
-            9 => format!("Performing memory test ({})", pct.unwrap_or_default()),
-            11 => "Recoverable".into(),
-            13 => "Check progress".into(),
-            14 => "Migratable".into(),
-            other => format!("Status {other}"),
+            6 => t!("Checking quota").into(),
+            7 => t!("Starting services").into(),
+            9 => t!("Performing memory test ({percent})", percent = pct.unwrap_or_default()),
+            11 => t!("Recoverable").into(),
+            13 => t!("Check progress").into(),
+            14 => t!("Migratable").into(),
+            other => t!("Status {other}", other = other),
         }
     }
 
@@ -272,11 +366,11 @@ impl NasInfo {
 pub fn memtest_result_message(code: u32) -> Result<(), &'static str> {
     match code {
         0 => Ok(()),
-        1 => Err("The account or password is invalid. Please try again."),
-        6 => Err("You are not authorized to use this service (login blocked)."),
-        8 => Err("The user account has been disabled."),
-        9 => Err("Please enter an administrator account."),
-        _ => Err("The NAS refused to start the memory test."),
+        1 => Err(t!("The account or password is invalid. Please try again.")),
+        6 => Err(t!("You are not authorized to use this service (login blocked).")),
+        8 => Err(t!("The user account has been disabled.")),
+        9 => Err(t!("Please enter an administrator account.")),
+        _ => Err(t!("The NAS refused to start the memory test.")),
     }
 }
 
@@ -317,6 +411,80 @@ mod tests {
         assert_eq!(n.status(), "Performing memory test (38.55%)");
         assert!(n.is_memtest_running());
         assert_eq!(n.web_url(false).unwrap(), "http://192.168.1.15:5000");
+    }
+
+    #[test]
+    fn normal_mode_reply_is_a_device_and_ack_is_not() {
+        // Shape of a reply from a NAS running DSM normally (type 2, status Ready).
+        let mut p = MAGIC.to_vec();
+        push_str(&mut p, field::MAC, "00:11:32:00:00:01");
+        p.extend_from_slice(&[field::IP, 4, 192, 168, 1, 15]);
+        push_u32(&mut p, field::PACKET_TYPE, PKT_ACK);
+        push_str(&mut p, field::SERVER_NAME, "nas");
+        push_u32(&mut p, field::SYS_STATUS, 1);
+        push_str(&mut p, field::MODEL, "DS220+");
+        push_u32(&mut p, field::HTTP_PORT, 5000);
+        let n = parse(&p).unwrap();
+        assert!(n.is_device_info());
+        assert_eq!(n.status(), "Ready");
+        assert_eq!(n.http_port, Some(5000));
+
+        // Memory-test acknowledgement: type 2 with a result code, no model.
+        let mut a = MAGIC.to_vec();
+        push_str(&mut a, field::MAC, "00:11:32:00:00:01");
+        a.extend_from_slice(&[field::IP, 4, 192, 168, 1, 15]);
+        push_u32(&mut a, field::PACKET_TYPE, PKT_ACK);
+        push_u32(&mut a, field::RESULT, 0);
+        let n = parse(&a).unwrap();
+        assert!(!n.is_device_info());
+        assert_eq!(n.result_code, Some(0));
+    }
+
+    #[test]
+    fn netsetting_packet_layout() {
+        let dev = NasInfo {
+            name: "nas".into(),
+            mac: "00:11:32:00:00:01".into(),
+            status_code: Some(1),
+            ..Default::default()
+        };
+        let ids = |p: &[u8]| {
+            let mut v = vec![];
+            let mut i = 8;
+            while i < p.len() {
+                v.push(p[i]);
+                i += 2 + p[i + 1] as usize;
+            }
+            v
+        };
+        let mut cfg = NetConfig {
+            dhcp: true,
+            ip: Ipv4Addr::new(192, 168, 1, 50),
+            netmask: Ipv4Addr::new(255, 255, 255, 0),
+            gateway: Ipv4Addr::new(192, 168, 1, 1),
+            dns: Ipv4Addr::new(192, 168, 1, 1),
+        };
+        // Order as in sendPktNetSetting: 21, 01, a4, 29, 20, c5, [22..25], 2a, 4a, c2.
+        let p = build_netsetting(&dev, &cfg, "admin", "pw", Some(7));
+        assert_eq!(ids(&p), [0x21, 0x01, 0xa4, 0x29, 0x20, 0xc5, 0x2a, 0x4a, 0xc2]);
+        assert_eq!(parse(&p).unwrap().packet_type, PKT_NETSET);
+        cfg.dhcp = false;
+        let p = build_netsetting(&dev, &cfg, "admin", "pw", Some(7));
+        assert_eq!(
+            ids(&p),
+            [
+                0x21, 0x01, 0xa4, 0x29, 0x20, 0xc5, 0x22, 0x23, 0x24, 0x25, 0x2a, 0x4a, 0xc2
+            ]
+        );
+        assert!(p.windows(6).any(|w| w == [0x22, 4, 192, 168, 1, 50]));
+        // A NAS that is not configured yet gets type 4 and no server name.
+        let fresh = NasInfo {
+            status_code: Some(0),
+            ..dev
+        };
+        let p = build_netsetting(&fresh, &cfg, "admin", "pw", None);
+        assert_eq!(parse(&p).unwrap().packet_type, PKT_NETSET_UNCONFIGURED);
+        assert_eq!(ids(&p)[0], 0x01);
     }
 
     #[test]

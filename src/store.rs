@@ -1,6 +1,7 @@
 //! Small JSON files in the per-user config directory
 //! (`~/Library/Application Support/SynologyAssistantRS` on macOS).
 
+use crate::t;
 use serde::{Serialize, de::DeserializeOwned};
 use std::io;
 use std::path::PathBuf;
@@ -43,12 +44,16 @@ pub fn now() -> u64 {
 pub fn ago(then: u64, now: u64) -> String {
     let s = now.saturating_sub(then);
     match s {
-        0..60 => "just now".into(),
-        60..3600 => format!("{} min ago", s / 60),
-        3600..86400 => format!("{} h ago", s / 3600),
+        0..60 => t!("just now").into(),
+        60..3600 => t!("{n} min ago", n = s / 60),
+        3600..86400 => t!("{n} h ago", n = s / 3600),
         _ => {
             let d = s / 86400;
-            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+            if d == 1 {
+                t!("1 day ago").to_string()
+            } else {
+                t!("{d} days ago", d = d)
+            }
         }
     }
 }
@@ -57,10 +62,16 @@ pub fn ago(then: u64, now: u64) -> String {
 pub fn duration(secs: u64) -> String {
     let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
     match (d, h) {
-        (0, 0) => format!("{} min", m.max(1)),
+        (0, 0) => t!("{m} min", m = m.max(1)),
         (0, _) if m == 0 => format!("{h} h"),
-        (0, _) => format!("{h} h {m} min"),
-        _ => format!("{d} day{} {h} h", if d == 1 { "" } else { "s" }),
+        (0, _) => t!("{h} h {m} min", h = h, m = m),
+        _ => {
+            if d == 1 {
+                t!("1 day {h} h", h = h)
+            } else {
+                t!("{d} days {h} h", d = d, h = h)
+            }
+        }
     }
 }
 

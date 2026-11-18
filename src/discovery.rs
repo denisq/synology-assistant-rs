@@ -26,6 +26,8 @@ pub struct Discovery {
     session: Arc<Session>,
     pub devices: DeviceMap,
     pub acks: AckMap,
+    /// Last error from sending a query (e.g. macOS denied local network access).
+    pub send_error: Mutex<Option<String>>,
 }
 
 fn open_socket() -> io::Result<UdpSocket> {
@@ -88,11 +90,13 @@ impl Discovery {
                     raw
                 };
                 let Some(info) = protocol::parse(pkt) else { continue };
-                if info.packet_type == protocol::PKT_ACK && !info.mac.is_empty() {
-                    if let Some(code) = info.result_code {
-                        rx_acks.lock().unwrap().insert(info.mac.clone(), (code, Instant::now()));
-                        on_update();
-                    }
+                // Acknowledgement of a command (type 2 with a result code).
+                if info.packet_type == protocol::PKT_ACK
+                    && !info.mac.is_empty()
+                    && let Some(code) = info.result_code
+                {
+                    rx_acks.lock().unwrap().insert(info.mac.clone(), (code, Instant::now()));
+                    on_update();
                     continue;
                 }
                 if !info.is_device_info() {
@@ -123,13 +127,26 @@ impl Discovery {
             session,
             devices,
             acks,
+            send_error: Mutex::new(None),
         })
     }
 
     fn broadcast(&self, pkt: &[u8]) {
+        let mut ok = false;
+        let mut err = None;
         for b in broadcast_targets() {
-            let _ = self.socket.send_to(pkt, SocketAddrV4::new(b, protocol::PORT));
+            match self.socket.send_to(pkt, SocketAddrV4::new(b, protocol::PORT)) {
+                Ok(_) => ok = true,
+                Err(e) => err = Some(e.to_string()),
+            }
         }
+        *self.send_error.lock().unwrap() = if ok { None } else { err };
+    }
+
+    /// Ask one address directly. Works across routers and some VPNs, where broadcasts don't.
+    pub fn query_ip(&self, ip: Ipv4Addr) {
+        let q = protocol::build_query(Some(&self.session));
+        let _ = self.socket.send_to(&q, SocketAddrV4::new(ip, protocol::PORT));
     }
 
     /// Send the discovery query (with our public key) on every interface.
@@ -155,6 +172,38 @@ impl Discovery {
             for i in 0..3 {
                 if i > 0 {
                     std::thread::sleep(Duration::from_secs(1));
+                }
+                for b in &targets {
+                    let _ = sock.send_to(&pkt, SocketAddrV4::new(*b, protocol::PORT));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Ask `dev` to apply a new network configuration. The answer arrives in `acks`.
+    pub fn apply_netsetting(
+        &self,
+        dev: &NasInfo,
+        cfg: &protocol::NetConfig,
+        account: &str,
+        password: &str,
+    ) -> io::Result<()> {
+        self.acks.lock().unwrap().remove(&dev.mac);
+        let encrypted = !dev.public_key.is_empty() && dev.session_id.is_some();
+        let plain = protocol::build_netsetting(dev, cfg, account, password, Some(self.session.id));
+        let pkt = if encrypted {
+            secure::seal(&plain, &dev.public_key).ok_or_else(|| io::Error::other("invalid NAS public key"))?
+        } else {
+            plain
+        };
+        // Like the original app: three rounds, three seconds apart, to the broadcast address.
+        let sock = self.socket.clone();
+        let targets = broadcast_targets();
+        std::thread::spawn(move || {
+            for i in 0..3 {
+                if i > 0 {
+                    std::thread::sleep(Duration::from_secs(3));
                 }
                 for b in &targets {
                     let _ = sock.send_to(&pkt, SocketAddrV4::new(*b, protocol::PORT));
